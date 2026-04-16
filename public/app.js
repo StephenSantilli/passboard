@@ -1,6 +1,6 @@
 const DEFAULT_GENERATOR_SETTINGS = {
   mode: "random",
-  randomSize: 20,
+  randomSize: 8,
   wordCount: 3,
   separator: "-",
   uppercase: true,
@@ -11,6 +11,7 @@ const DEFAULT_GENERATOR_SETTINGS = {
 };
 
 const HISTORY_PREVIEW_LIMIT = 25;
+const ACTIVE_ROOM_STORAGE_KEY = "passboard-active-room";
 
 const state = {
   roomKey: null,
@@ -32,7 +33,6 @@ const state = {
 
 const elements = {
   roomNavbar: document.getElementById("room-navbar"),
-  homeButton: document.getElementById("home-button"),
   leaveRoomButton: document.getElementById("leave-room-button"),
   destroyRoomButton: document.getElementById("destroy-room-button"),
   boardView: document.getElementById("board-view"),
@@ -41,8 +41,8 @@ const elements = {
   roomKeyInput: document.getElementById("room-key-input"),
   joinRoomForm: document.getElementById("join-room-form"),
   createRoomButton: document.getElementById("create-room-button"),
-  roomLink: document.getElementById("room-link"),
   copyRoomLink: document.getElementById("copy-room-link"),
+  viewRoomLink: document.getElementById("view-room-link"),
   connectionStatus: document.getElementById("board-live-indicator"),
   connectionLabel: document.getElementById("connection-label"),
   connectionDetail: document.getElementById("connection-detail"),
@@ -60,6 +60,7 @@ const elements = {
   copyNewItemUsername: document.getElementById("copy-new-item-username"),
   copyNewItemPassword: document.getElementById("copy-new-item-password"),
   generateNewItemPassword: document.getElementById("generate-new-item-password"),
+  viewNewItemPassword: document.getElementById("view-new-item-password"),
   itemsContainer: document.getElementById("items-container"),
   itemCount: document.getElementById("item-count"),
   itemTemplate: document.getElementById("item-template"),
@@ -68,19 +69,55 @@ const elements = {
   generatorSlider: document.getElementById("generator-size"),
   generatorSliderLabel: document.getElementById("generator-slider-label"),
   generatorSliderValue: document.getElementById("generator-slider-value"),
+  generatorPreview: document.getElementById("generator-preview"),
   openGeneratorSettings: document.getElementById("open-generator-settings"),
   nameDialog: document.getElementById("name-dialog"),
   nameForm: document.getElementById("name-form"),
-  displayNameInput: document.getElementById("display-name-input")
+  displayNameInput: document.getElementById("display-name-input"),
+  passwordViewDialog: document.getElementById("password-view-dialog"),
+  passwordViewValue: document.getElementById("password-view-value"),
+  copyLargePassword: document.getElementById("copy-large-password"),
+  roomLinkDialog: document.getElementById("room-link-dialog"),
+  roomLinkViewValue: document.getElementById("room-link-view-value"),
+  copyLargeRoomLink: document.getElementById("copy-large-room-link")
 };
 
 function getDisplayNameStorageKey(roomKey) {
   return `password-board-display-name:${roomKey}`;
 }
 
+function getStoredActiveRoomKey() {
+  return localStorage.getItem(ACTIVE_ROOM_STORAGE_KEY) || "";
+}
+
+function setStoredActiveRoomKey(roomKey) {
+  localStorage.setItem(ACTIVE_ROOM_STORAGE_KEY, roomKey);
+}
+
+function clearStoredRoomSession(roomKey = state.roomKey) {
+  localStorage.removeItem(ACTIVE_ROOM_STORAGE_KEY);
+  if (roomKey) {
+    localStorage.removeItem(getDisplayNameStorageKey(roomKey));
+  }
+}
+
+function handleRoomClosure(message) {
+  clearStoredRoomSession();
+  if (state.socket) {
+    state.socket.disconnect();
+    state.socket = null;
+  }
+  alert(message);
+  window.location.assign("/");
+}
+
+function getRoomJoinUrl(roomKey = state.roomKey) {
+  return new URL(`/room/${roomKey}`, window.location.origin).toString();
+}
+
 function normalizeGeneratorSettings(settings = {}) {
   const mode = settings.mode === "words" ? "words" : "random";
-  const randomSize = Math.min(64, Math.max(8, Number(settings.randomSize ?? settings.size ?? 20) || 20));
+  const randomSize = Math.min(64, Math.max(8, Number(settings.randomSize ?? settings.size ?? 8) || 8));
   const wordCount = Math.min(8, Math.max(2, Number(settings.wordCount ?? settings.size ?? 3) || 3));
 
   return {
@@ -359,6 +396,19 @@ function renderBoardAuditMeta() {
   elements.boardAuditMeta.classList.remove("hidden");
 }
 
+function openLargePasswordView(password) {
+  elements.passwordViewValue.textContent = password || "";
+  elements.copyLargePassword.dataset.passwordValue = password || "";
+  elements.passwordViewDialog.showModal();
+}
+
+function openLargeRoomLinkView(roomKey = state.roomKey) {
+  const roomLink = getRoomJoinUrl(roomKey);
+  elements.roomLinkViewValue.textContent = roomLink;
+  elements.copyLargeRoomLink.dataset.roomLinkValue = roomLink;
+  elements.roomLinkDialog.showModal();
+}
+
 function buildExportPayload() {
   return {
     format: "password-board-v1",
@@ -371,7 +421,7 @@ function buildExportPayload() {
     items: state.items.map((item) => ({
       sortOrder: item.sortOrder,
       name: item.name,
-      port: item.port,
+      ip: item.ip,
       username: item.username,
       password: item.password,
       createdAt: item.createdAt,
@@ -417,13 +467,14 @@ async function importBoardFromFile(file) {
 function showBoard(roomKey, actorName) {
   state.roomKey = roomKey;
   state.actorName = actorName;
+  setStoredActiveRoomKey(roomKey);
   elements.hero.classList.add("hidden");
   elements.securityNotes.classList.add("hidden");
   elements.roomNavbar.classList.remove("hidden");
   elements.boardView.classList.remove("hidden");
-  elements.roomLink.value = new URL(`/room/${roomKey}`, window.location.origin).toString();
   elements.signedInName.textContent = actorName;
   elements.newItemPassword.value = generatePassword();
+  window.history.replaceState({}, "", "/room");
 }
 
 async function createRoom() {
@@ -435,7 +486,19 @@ async function createRoom() {
 async function bootstrapRoom(roomKey) {
   const response = await fetch(`/api/rooms/${roomKey}/bootstrap`);
   if (!response.ok) {
-    throw new Error("Unable to open that room.");
+    let errorMessage = "Unable to open that room.";
+    try {
+      const payload = await response.json();
+      if (payload?.error) {
+        errorMessage = payload.error;
+      }
+    } catch (_error) {
+      // Ignore parse failure and keep the generic message.
+    }
+
+    const error = new Error(errorMessage);
+    error.statusCode = response.status;
+    throw error;
   }
 
   const payload = await response.json();
@@ -498,8 +561,16 @@ function connectSocket(roomKey, actorName) {
 
   socket.on("room:destroyed", (payload) => {
     const destroyedBy = payload?.destroyedBy ? ` by ${payload.destroyedBy}` : "";
-    alert(`This board was destroyed${destroyedBy}.`);
-    window.location.assign("/");
+    handleRoomClosure(`This board was destroyed${destroyedBy}.`);
+  });
+
+  socket.on("room:closed", (payload) => {
+    if (payload?.reason === "expired") {
+      handleRoomClosure("This board has expired and is no longer available.");
+      return;
+    }
+
+    handleRoomClosure("This board is no longer available.");
   });
 
   state.socket = socket;
@@ -556,12 +627,13 @@ function syncGeneratorModeUi() {
   const mode = elements.generatorForm.elements.namedItem("mode").value || "random";
   const slider = elements.generatorSlider;
   const isWords = mode === "words";
-  const settings = readGeneratorSettingsFromForm();
+  const randomSize = Number(elements.generatorForm.dataset.randomSize) || state.generatorSettings.randomSize;
+  const wordCount = Number(elements.generatorForm.dataset.wordCount) || state.generatorSettings.wordCount;
 
   elements.generatorSliderLabel.textContent = isWords ? "Words" : "Length";
   slider.min = isWords ? "2" : "8";
   slider.max = isWords ? "8" : "64";
-  slider.value = String(isWords ? settings.wordCount : settings.randomSize);
+  slider.value = String(isWords ? wordCount : randomSize);
   elements.generatorSliderValue.textContent = slider.value;
 
   document.querySelectorAll(".generator-random-option").forEach((node) => {
@@ -570,6 +642,16 @@ function syncGeneratorModeUi() {
   document.querySelectorAll(".generator-word-option").forEach((node) => {
     node.hidden = !isWords;
   });
+
+  updateGeneratorPreview();
+}
+
+function updateGeneratorPreview(settings = readGeneratorSettingsFromForm()) {
+  try {
+    elements.generatorPreview.textContent = generatePassword(settings);
+  } catch (error) {
+    elements.generatorPreview.textContent = error.message || "Unable to generate preview.";
+  }
 }
 
 function readGeneratorSettingsFromForm() {
@@ -596,6 +678,11 @@ function readGeneratorSettingsFromForm() {
 function promptForDisplayName(roomKey) {
   return new Promise((resolve) => {
     const savedName = localStorage.getItem(getDisplayNameStorageKey(roomKey)) || "";
+    if (savedName) {
+      resolve(savedName);
+      return;
+    }
+
     elements.displayNameInput.value = savedName;
     const preventClose = (event) => event.preventDefault();
     elements.nameDialog.addEventListener("cancel", preventClose, { once: true });
@@ -632,8 +719,9 @@ function renderItems() {
   state.items.forEach((item) => {
     const fragment = elements.itemTemplate.content.cloneNode(true);
     const row = fragment.querySelector(".board-row");
+    const dragHandle = fragment.querySelector("[data-drag-handle]");
     const nameInput = fragment.querySelector('[data-field="name"]');
-    const portInput = fragment.querySelector('[data-field="port"]');
+    const ipInput = fragment.querySelector('[data-field="ip"]');
     const usernameInput = fragment.querySelector('[data-field="username"]');
     const passwordInput = fragment.querySelector('[data-field="password"]');
     const historyList = fragment.querySelector("[data-history]");
@@ -643,7 +731,7 @@ function renderItems() {
     row.dataset.itemId = item.id;
 
     nameInput.value = item.name;
-    portInput.value = item.port;
+    ipInput.value = item.ip || "";
     usernameInput.value = item.username;
     passwordInput.value = item.password;
     passwordInput.type = state.passwordsHidden ? "password" : "text";
@@ -669,6 +757,7 @@ function renderItems() {
         const copyButton = document.createElement("button");
         copyButton.className = "secondary";
         copyButton.textContent = "Copy";
+        copyButton.title = "Copy password";
         copyButton.addEventListener("click", async () => {
           await navigator.clipboard.writeText(entry.password);
         });
@@ -680,6 +769,7 @@ function renderItems() {
       if (item.history.length > visibleCount) {
         const showMoreButton = document.createElement("button");
         showMoreButton.className = "secondary history-more-button";
+        showMoreButton.title = "Show older password history";
         const remaining = item.history.length - visibleCount;
         const increment = Math.min(HISTORY_PREVIEW_LIMIT, remaining);
         showMoreButton.textContent = `Show ${increment} older`;
@@ -698,12 +788,12 @@ function renderItems() {
 
     auditLabel.textContent = `Created by ${item.createdBy || "unknown"} · ${item.passwordRotationCount || 0} rotation${item.passwordRotationCount === 1 ? "" : "s"}`;
 
-    [nameInput, portInput, usernameInput].forEach((input) => {
+    [nameInput, ipInput, usernameInput].forEach((input) => {
       input.addEventListener("change", async () => {
         await emit("item:updateMeta", {
           id: item.id,
           name: nameInput.value,
-          port: portInput.value,
+          ip: ipInput.value,
           username: usernameInput.value
         });
       });
@@ -760,19 +850,25 @@ function renderItems() {
       });
 
     fragment
+      .querySelector('[data-action="show-password-large"]')
+      .addEventListener("click", () => {
+        openLargePasswordView(passwordInput.value);
+      });
+
+    fragment
       .querySelector('[data-action="delete-item"]')
       .addEventListener("click", async () => {
         await emit("item:delete", { id: item.id });
       });
 
-    row.addEventListener("dragstart", (event) => {
+    dragHandle.addEventListener("dragstart", (event) => {
       state.draggedItemId = item.id;
       row.classList.add("dragging");
       event.dataTransfer.effectAllowed = "move";
       event.dataTransfer.setData("text/plain", item.id);
     });
 
-    row.addEventListener("dragend", () => {
+    dragHandle.addEventListener("dragend", () => {
       state.draggedItemId = null;
       row.classList.remove("dragging");
       elements.itemsContainer.querySelectorAll(".drop-target").forEach((node) => {
@@ -820,14 +916,11 @@ function renderItems() {
 
 elements.createRoomButton.addEventListener("click", createRoom);
 
-elements.homeButton.addEventListener("click", () => {
-  window.location.assign("/");
-});
-
 elements.leaveRoomButton.addEventListener("click", () => {
   if (state.socket) {
     state.socket.disconnect();
   }
+  clearStoredRoomSession();
   window.location.assign("/");
 });
 
@@ -857,7 +950,11 @@ elements.joinRoomForm.addEventListener("submit", (event) => {
 });
 
 elements.copyRoomLink.addEventListener("click", async (event) => {
-  await copyWithFeedback(event.currentTarget, elements.roomLink.value);
+  await copyWithFeedback(event.currentTarget, getRoomJoinUrl());
+});
+
+elements.viewRoomLink.addEventListener("click", () => {
+  openLargeRoomLinkView();
 });
 
 elements.copyNewItemUsername.addEventListener("click", async (event) => {
@@ -914,12 +1011,24 @@ elements.generateNewItemPassword.addEventListener("click", () => {
   setFreshGeneratedPassword(elements.newItemPassword);
 });
 
+elements.viewNewItemPassword.addEventListener("click", () => {
+  openLargePasswordView(elements.newItemPassword.value);
+});
+
+elements.copyLargePassword.addEventListener("click", async (event) => {
+  await copyWithFeedback(event.currentTarget, event.currentTarget.dataset.passwordValue || "");
+});
+
+elements.copyLargeRoomLink.addEventListener("click", async (event) => {
+  await copyWithFeedback(event.currentTarget, event.currentTarget.dataset.roomLinkValue || "");
+});
+
 elements.createItemForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   const formData = new FormData(elements.createItemForm);
   await emit("item:create", {
     name: formData.get("name"),
-    port: formData.get("port"),
+    ip: formData.get("ip"),
     username: formData.get("username"),
     password: formData.get("password")
   });
@@ -941,10 +1050,24 @@ elements.generatorSlider.addEventListener("input", () => {
     elements.generatorForm.dataset.randomSize = elements.generatorSlider.value;
   }
   elements.generatorSliderValue.textContent = elements.generatorSlider.value;
+  updateGeneratorPreview();
 });
 
 Array.from(elements.generatorForm.elements.namedItem("mode")).forEach((radio) => {
   radio.addEventListener("change", syncGeneratorModeUi);
+});
+
+["separator", "uppercase", "lowercase", "numbers", "symbols", "excludeSimilar"].forEach((fieldName) => {
+  const field = elements.generatorForm.elements.namedItem(fieldName);
+  if (!field) {
+    return;
+  }
+  field.addEventListener("input", () => {
+    updateGeneratorPreview();
+  });
+  field.addEventListener("change", () => {
+    updateGeneratorPreview();
+  });
 });
 
 elements.generatorForm.addEventListener("submit", (event) => {
@@ -965,19 +1088,25 @@ elements.generatorForm.addEventListener("submit", (event) => {
 });
 
 async function initialize() {
+  await loadWordList();
   applyGeneratorSettingsToForm();
   setInterval(updateRelativeTimestamps, 30000);
-  await loadWordList();
 
-  const roomKey = window.location.pathname.startsWith("/room/")
-    ? window.location.pathname.split("/room/")[1]
-    : null;
+  const url = new URL(window.location.href);
+  const queryRoomKey = extractRoomKey(url.searchParams.get("roomKey") || "");
+  if (queryRoomKey) {
+    setStoredActiveRoomKey(queryRoomKey);
+    window.history.replaceState({}, "", "/room");
+  }
+
+  const roomKey = window.location.pathname === "/room" ? getStoredActiveRoomKey() : null;
 
   if (!roomKey) {
     return;
   }
 
   if (!isUuid(roomKey)) {
+    clearStoredRoomSession(roomKey);
     alert("That room link is not a valid UUID.");
     return;
   }
@@ -985,8 +1114,16 @@ async function initialize() {
   const actorName = await promptForDisplayName(roomKey);
   showBoard(roomKey, actorName);
   setConnectionStatus("connecting", "Waiting for first sync");
-  await bootstrapRoom(roomKey);
-  connectSocket(roomKey, actorName);
+
+  try {
+    await bootstrapRoom(roomKey);
+    connectSocket(roomKey, actorName);
+  } catch (error) {
+    if (error.statusCode === 404 || /expired|not found/i.test(error.message || "")) {
+      clearStoredRoomSession(roomKey);
+    }
+    throw error;
+  }
 }
 
 initialize().catch((error) => {

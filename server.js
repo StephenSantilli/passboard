@@ -30,7 +30,7 @@ const ROOM_CLEANUP_INTERVAL_MS = 60 * 60 * 1000;
 const MAX_BOARD_NAME_LENGTH = 80;
 const MAX_ACTOR_NAME_LENGTH = 40;
 const MAX_ITEM_NAME_LENGTH = 120;
-const MAX_PORT_LENGTH = 24;
+const MAX_IP_LENGTH = 120;
 const MAX_USERNAME_LENGTH = 120;
 const MAX_PASSWORD_LENGTH = 512;
 const MAX_ITEMS_PER_ROOM = 250;
@@ -73,6 +73,7 @@ db.exec(`
     room_id TEXT NOT NULL,
     sort_order REAL NOT NULL DEFAULT 0,
     name TEXT NOT NULL,
+    ip TEXT NOT NULL DEFAULT '',
     port TEXT NOT NULL,
     username TEXT NOT NULL,
     password_cipher TEXT,
@@ -118,6 +119,7 @@ addColumnIfMissing("rooms", "last_imported_by", "TEXT NOT NULL DEFAULT ''");
 addColumnIfMissing("rooms", "updated_at", "TEXT NOT NULL DEFAULT ''");
 addColumnIfMissing("rooms", "updated_by", "TEXT NOT NULL DEFAULT ''");
 addColumnIfMissing("items", "sort_order", "REAL NOT NULL DEFAULT 0");
+addColumnIfMissing("items", "ip", "TEXT NOT NULL DEFAULT ''");
 addColumnIfMissing("items", "created_by", "TEXT NOT NULL DEFAULT ''");
 addColumnIfMissing("items", "updated_by", "TEXT NOT NULL DEFAULT ''");
 addColumnIfMissing("items", "password_rotation_count", "INTEGER NOT NULL DEFAULT 0");
@@ -183,6 +185,7 @@ const selectItemsStmt = db.prepare(`
     i.id,
     i.sort_order,
     i.name,
+    i.ip,
     i.port,
     i.username,
     i.password_cipher,
@@ -219,6 +222,7 @@ const insertItemStmt = db.prepare(`
     room_id,
     sort_order,
     name,
+    ip,
     port,
     username,
     password_cipher,
@@ -234,6 +238,7 @@ const insertItemStmt = db.prepare(`
     @roomId,
     @sortOrder,
     @name,
+    @ip,
     @port,
     @username,
     @passwordCipher,
@@ -269,6 +274,7 @@ const updateItemFieldsStmt = db.prepare(`
   UPDATE items
   SET
     name = @name,
+    ip = @ip,
     port = @port,
     username = @username,
     updated_at = @updatedAt,
@@ -384,7 +390,8 @@ const importRoomState = db.transaction(({ roomId, roomKey, actorName, boardName,
       roomId,
       sortOrder,
       name: item.name,
-      port: item.port,
+      ip: item.ip,
+      port: "",
       username: item.username,
       passwordCipher: encrypted.cipher,
       passwordIv: encrypted.iv,
@@ -433,7 +440,7 @@ function normalizeImportedItems(items) {
   return items.map((item) => ({
     sortOrder: item?.sortOrder,
     name: normalizeItemName(item?.name),
-    port: normalizePort(item?.port),
+    ip: normalizeIp(item?.ip),
     username: normalizeUsername(item?.username),
     password: normalizePassword(item?.password),
     createdAt: item?.createdAt,
@@ -471,7 +478,7 @@ function roomExpiryCutoffIso(referenceTime = Date.now()) {
 
 function normalizeGeneratorSettings(settings = {}) {
   const mode = settings?.mode === "words" ? "words" : "random";
-  const randomSize = Math.min(64, Math.max(8, Number(settings?.randomSize ?? settings?.size ?? 20) || 20));
+  const randomSize = Math.min(64, Math.max(8, Number(settings?.randomSize ?? settings?.size ?? 8) || 8));
   const wordCount = Math.min(8, Math.max(2, Number(settings?.wordCount ?? settings?.size ?? 3) || 3));
 
   return {
@@ -541,10 +548,10 @@ function normalizeItemName(value) {
   });
 }
 
-function normalizePort(value) {
+function normalizeIp(value) {
   return normalizeBoundedString(value, {
-    fieldName: "Port",
-    maxLength: MAX_PORT_LENGTH
+    fieldName: "IP",
+    maxLength: MAX_IP_LENGTH
   });
 }
 
@@ -666,6 +673,12 @@ function roomLookupId(roomKey) {
   return roomHash(roomKey);
 }
 
+function createRoomGoneError() {
+  const error = new Error("Room not found or has expired.");
+  error.code = "ROOM_GONE";
+  return error;
+}
+
 function deriveRoomEncryptionKey(roomKey) {
   return crypto.hkdfSync(
     "sha256",
@@ -753,7 +766,28 @@ function getActiveRoom(roomKey) {
 
 function requireActiveRoom(roomKey) {
   cleanupExpiredRooms();
-  return getActiveRoom(roomKey);
+  const room = getActiveRoom(roomKey);
+  if (!room) {
+    throw createRoomGoneError();
+  }
+  return room;
+}
+
+function assertActiveRoomForMutation(roomKey) {
+  return requireActiveRoom(roomKey);
+}
+
+function assertMutationApplied(result, message) {
+  if (!result?.changes) {
+    throw new Error(message);
+  }
+}
+
+function emitRoomClosed(roomKey, reason = "expired") {
+  io.to(roomLookupId(roomKey)).emit("room:closed", {
+    reason,
+    closedAt: nowIso()
+  });
 }
 
 function getActiveUsers(roomKey) {
@@ -778,10 +812,6 @@ function getActiveUsers(roomKey) {
 
 function mapRoomState(roomKey) {
   const room = requireActiveRoom(roomKey);
-  if (!room) {
-    throw new Error("Room not found or has expired.");
-  }
-
   const id = room.id;
   const rows = selectItemsStmt.all(id);
 
@@ -799,7 +829,7 @@ function mapRoomState(roomKey) {
       id: row.id,
       sortOrder: row.sort_order,
       name: row.name,
-      port: row.port,
+      ip: row.ip,
       username: row.username,
       password: decryptPassword(roomKey, {
         cipher: row.password_cipher,
@@ -926,6 +956,10 @@ app.get("/api/rooms/new", (req, res) => {
   }
 });
 
+app.get("/room", (_req, res) => {
+  return res.sendFile(path.join(__dirname, "public", "index.html"));
+});
+
 app.use((error, _req, res, next) => {
   if (!error) {
     next();
@@ -955,7 +989,7 @@ app.get("/room/:roomKey", (req, res) => {
     return res.status(404).send("Room not found or has expired.");
   }
 
-  return res.sendFile(path.join(__dirname, "public", "index.html"));
+  return res.redirect(302, `/room?roomKey=${encodeURIComponent(req.params.roomKey)}`);
 });
 
 io.use((socket, next) => {
@@ -981,13 +1015,16 @@ io.use((socket, next) => {
 });
 
 function emitRoomState(roomKey) {
-  const room = requireActiveRoom(roomKey);
-  if (!room) {
-    return;
+  try {
+    const state = mapRoomState(roomKey);
+    io.to(roomLookupId(roomKey)).emit("room:state", state);
+  } catch (error) {
+    if (error.code === "ROOM_GONE") {
+      emitRoomClosed(roomKey, "expired");
+      return;
+    }
+    throw error;
   }
-
-  const state = mapRoomState(roomKey);
-  io.to(roomLookupId(roomKey)).emit("room:state", state);
 }
 
 io.on("connection", (socket) => {
@@ -997,41 +1034,52 @@ io.on("connection", (socket) => {
 
   socket.on("room:updateName", (payload, callback = () => {}) => {
     try {
+      assertActiveRoomForMutation(roomKey);
       requireMutationRateLimit(socket, roomId, "room-update");
       const name = normalizeBoardName(payload?.name);
-      updateRoomNameStmt.run({
+      const result = updateRoomNameStmt.run({
         id: roomId,
         name,
         updatedAt: nowIso(),
         updatedBy: actorName
       });
+      assertMutationApplied(result, "Room not found or has expired.");
 
       emitRoomState(roomKey);
       callback({ ok: true });
     } catch (error) {
+      if (error.code === "ROOM_GONE") {
+        emitRoomClosed(roomKey, "expired");
+      }
       callback({ ok: false, error: error.message });
     }
   });
 
   socket.on("room:updateGeneratorSettings", (payload, callback = () => {}) => {
     try {
+      assertActiveRoomForMutation(roomKey);
       requireMutationRateLimit(socket, roomId, "room-settings");
-      updateRoomGeneratorSettingsStmt.run({
+      const result = updateRoomGeneratorSettingsStmt.run({
         id: roomId,
         generatorSettings: serializeGeneratorSettings(payload?.generatorSettings),
         updatedAt: nowIso(),
         updatedBy: actorName
       });
+      assertMutationApplied(result, "Room not found or has expired.");
 
       emitRoomState(roomKey);
       callback({ ok: true });
     } catch (error) {
+      if (error.code === "ROOM_GONE") {
+        emitRoomClosed(roomKey, "expired");
+      }
       callback({ ok: false, error: error.message });
     }
   });
 
   socket.on("room:import", (payload, callback = () => {}) => {
     try {
+      assertActiveRoomForMutation(roomKey);
       requireMutationRateLimit(socket, roomId, "room-import");
       requireSocketRateLimit(socket, "room-import", SOCKET_IMPORT_LIMIT, SOCKET_IMPORT_WINDOW_MS);
       validateImportPayload(payload);
@@ -1049,12 +1097,16 @@ io.on("connection", (socket) => {
       emitRoomState(roomKey);
       callback({ ok: true });
     } catch (error) {
+      if (error.code === "ROOM_GONE") {
+        emitRoomClosed(roomKey, "expired");
+      }
       callback({ ok: false, error: error.message });
     }
   });
 
   socket.on("items:reorder", (payload, callback = () => {}) => {
     try {
+      assertActiveRoomForMutation(roomKey);
       requireMutationRateLimit(socket, roomId, "reorder");
       const orderedIds = Array.isArray(payload?.orderedIds)
         ? payload.orderedIds.map((id) => String(id))
@@ -1076,12 +1128,16 @@ io.on("connection", (socket) => {
       emitRoomState(roomKey);
       callback({ ok: true });
     } catch (error) {
+      if (error.code === "ROOM_GONE") {
+        emitRoomClosed(roomKey, "expired");
+      }
       callback({ ok: false, error: error.message });
     }
   });
 
   socket.on("item:create", (payload, callback = () => {}) => {
     try {
+      assertActiveRoomForMutation(roomKey);
       requireMutationRateLimit(socket, roomId, "item-create");
       const createdAt = nowIso();
       requireRoomCapacity(roomId);
@@ -1094,7 +1150,8 @@ io.on("connection", (socket) => {
         roomId,
         sortOrder: nextSortOrder,
         name: normalizeItemName(payload?.name),
-        port: normalizePort(payload?.port),
+        ip: normalizeIp(payload?.ip),
+        port: "",
         username: normalizeUsername(payload?.username),
         passwordCipher: encrypted.cipher,
         passwordIv: encrypted.iv,
@@ -1109,33 +1166,43 @@ io.on("connection", (socket) => {
       emitRoomState(roomKey);
       callback({ ok: true });
     } catch (error) {
+      if (error.code === "ROOM_GONE") {
+        emitRoomClosed(roomKey, "expired");
+      }
       callback({ ok: false, error: error.message });
     }
   });
 
   socket.on("item:updateMeta", (payload, callback = () => {}) => {
     try {
+      assertActiveRoomForMutation(roomKey);
       requireMutationRateLimit(socket, roomId, "item-update");
       const itemId = String(payload?.id || "");
-      updateItemFieldsStmt.run({
+      const result = updateItemFieldsStmt.run({
         id: itemId,
         roomId,
         name: normalizeItemName(payload?.name),
-        port: normalizePort(payload?.port),
+        ip: normalizeIp(payload?.ip),
+        port: "",
         username: normalizeUsername(payload?.username),
         updatedAt: nowIso(),
         updatedBy: actorName
       });
+      assertMutationApplied(result, "Item not found.");
 
       emitRoomState(roomKey);
       callback({ ok: true });
     } catch (error) {
+      if (error.code === "ROOM_GONE") {
+        emitRoomClosed(roomKey, "expired");
+      }
       callback({ ok: false, error: error.message });
     }
   });
 
   socket.on("item:updatePassword", (payload, callback = () => {}) => {
     try {
+      assertActiveRoomForMutation(roomKey);
       requireMutationRateLimit(socket, roomId, "password-update");
       setItemPasswordWithHistory({
         itemId: String(payload?.id || ""),
@@ -1149,25 +1216,35 @@ io.on("connection", (socket) => {
       emitRoomState(roomKey);
       callback({ ok: true });
     } catch (error) {
+      if (error.code === "ROOM_GONE") {
+        emitRoomClosed(roomKey, "expired");
+      }
       callback({ ok: false, error: error.message });
     }
   });
 
   socket.on("item:delete", (payload, callback = () => {}) => {
     try {
+      assertActiveRoomForMutation(roomKey);
       requireMutationRateLimit(socket, roomId, "item-delete");
-      deleteItemStmt.run(String(payload?.id || ""), roomId);
+      const result = deleteItemStmt.run(String(payload?.id || ""), roomId);
+      assertMutationApplied(result, "Item not found.");
       emitRoomState(roomKey);
       callback({ ok: true });
     } catch (error) {
+      if (error.code === "ROOM_GONE") {
+        emitRoomClosed(roomKey, "expired");
+      }
       callback({ ok: false, error: error.message });
     }
   });
 
   socket.on("room:destroy", (_payload, callback = () => {}) => {
     try {
+      assertActiveRoomForMutation(roomKey);
       requireMutationRateLimit(socket, roomId, "room-destroy");
-      deleteRoomStmt.run(roomId);
+      const result = deleteRoomStmt.run(roomId);
+      assertMutationApplied(result, "Room not found or has expired.");
       io.to(roomId).emit("room:destroyed", {
         destroyedAt: nowIso(),
         destroyedBy: actorName
@@ -1185,6 +1262,9 @@ io.on("connection", (socket) => {
         });
       }, 25);
     } catch (error) {
+      if (error.code === "ROOM_GONE") {
+        emitRoomClosed(roomKey, "expired");
+      }
       callback({ ok: false, error: error.message });
     }
   });

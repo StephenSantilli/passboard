@@ -8,7 +8,7 @@ Real-time room-based password sharing for teams in cybersecurity competitions. A
 - Name-only join flow for change attribution
 - Live updates
 - Board naming with shared updates
-- Board items with name, port, username, and password
+- Board items with name, IP, username, and password
 - Password history per item
 - One-click copy and direct inline password editing
 - Configurable password generator with random and short-word modes

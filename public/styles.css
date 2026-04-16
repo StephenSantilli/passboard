@@ -63,7 +63,7 @@ input:focus {
 }
 
 .app-shell {
-  width: min(1200px, calc(100vw - 2rem));
+  width: min(1440px, calc(100vw - 2rem));
   margin: 0 auto;
   padding: 2rem 0 4rem;
 }
@@ -260,6 +260,10 @@ h1 {
   margin-bottom: 1rem;
 }
 
+.room-link-block {
+  margin-bottom: 1rem;
+}
+
 .user-chip {
   padding: 0.45rem 0.8rem;
   border-radius: 999px;
@@ -395,7 +399,7 @@ summary {
 .board-columns,
 .board-row {
   display: grid;
-  grid-template-columns: 44px minmax(0, 1fr) 90px minmax(0, 1fr) minmax(0, 2.2fr) minmax(160px, 1fr) 100px;
+  grid-template-columns: 44px minmax(120px, 1fr) minmax(150px, 1.2fr) minmax(150px, 1fr) minmax(360px, 2.9fr) minmax(180px, 1fr) 88px;
   gap: 0.9rem;
   align-items: center;
   width: 100%;
@@ -436,7 +440,8 @@ summary {
 .password-row {
   align-items: stretch;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto auto;
+  grid-template-columns: minmax(0, 1fr) auto auto auto;
+  gap: 0.5rem;
 }
 
 .password-input,
@@ -495,6 +500,14 @@ summary {
   box-shadow: 0 0 0 1px rgba(255, 142, 0, 0.18), 0 0 14px rgba(247, 105, 0, 0.18);
 }
 
+.secondary.copied,
+.ghost.copied {
+  background: rgba(247, 105, 0, 0.95);
+  color: #fff3e8;
+  border-color: transparent;
+  box-shadow: 0 0 0 1px rgba(255, 142, 0, 0.18), 0 0 14px rgba(247, 105, 0, 0.18);
+}
+
 .icon-button.standalone {
   position: static;
   transform: none;
@@ -519,6 +532,10 @@ summary {
   cursor: grab;
   user-select: none;
   font-size: 1.1rem;
+}
+
+.drag-cell:active {
+  cursor: grabbing;
 }
 
 .board-row.dragging {
@@ -591,6 +608,7 @@ summary {
 
 .room-link-row {
   margin-top: 0.5rem;
+  justify-content: flex-start;
 }
 
 .room-link-copy-button {
@@ -630,6 +648,12 @@ summary {
   line-height: 1.45;
 }
 
+[data-meta="updated-at"] {
+  display: block;
+  font-size: 0.88rem;
+  line-height: 1.45;
+}
+
 .hidden {
   display: none;
 }
@@ -651,11 +675,37 @@ dialog::backdrop {
   border-radius: 26px;
 }
 
+.password-view-card {
+  width: min(780px, calc(100vw - 1rem));
+}
+
+.password-view-value {
+  min-height: 140px;
+  padding: 1.15rem 1.25rem;
+  border-radius: 22px;
+  border: 1px solid rgba(145, 210, 255, 0.12);
+  background: rgba(8, 18, 28, 0.9);
+  color: var(--text);
+  font-family: "SFMono-Regular", Menlo, Monaco, Consolas, monospace;
+  font-size: clamp(1.4rem, 3vw, 2.6rem);
+  line-height: 1.4;
+  letter-spacing: 0.04em;
+  word-break: break-word;
+  display: flex;
+  align-items: center;
+}
+
 .dialog-card label,
 .mode-group {
   display: flex;
   flex-direction: column;
   gap: 0.6rem;
+}
+
+.generator-section > span,
+.generator-section > strong,
+.mode-group legend {
+  font-weight: 700;
 }
 
 .mode-group {
@@ -706,14 +756,49 @@ dialog::backdrop {
   gap: 0.75rem 1rem;
 }
 
-.checkbox {
-  display: flex;
-  align-items: center;
-  gap: 0.75rem;
+.generator-toggle {
+  position: relative;
+  cursor: pointer;
 }
 
-.checkbox input {
-  width: auto;
+.generator-toggle input {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.generator-toggle span {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 50px;
+  padding: 0.8rem 1rem;
+  border-radius: 16px;
+  border: 1px solid rgba(145, 210, 255, 0.12);
+  background: rgba(8, 18, 28, 0.72);
+  color: var(--muted);
+  text-align: center;
+  transition: background 140ms ease, color 140ms ease, border-color 140ms ease, box-shadow 140ms ease;
+}
+
+.generator-toggle input:checked + span {
+  background: rgba(247, 105, 0, 0.18);
+  color: var(--text);
+  border-color: rgba(247, 105, 0, 0.36);
+  box-shadow: 0 0 0 1px rgba(247, 105, 0, 0.12);
+}
+
+.generator-preview {
+  min-height: 64px;
+  padding: 0.95rem 1rem;
+  border-radius: 18px;
+  border: 1px solid rgba(145, 210, 255, 0.12);
+  background: rgba(8, 18, 28, 0.9);
+  font-family: "SFMono-Regular", Menlo, Monaco, Consolas, monospace;
+  font-size: 1.05rem;
+  line-height: 1.45;
+  word-break: break-word;
 }
 
 input[type="range"] {

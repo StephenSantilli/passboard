@@ -198,6 +198,36 @@ function isUuid(value) {
   );
 }
 
+function extractRoomKey(value) {
+  const trimmed = String(value || "").trim();
+  if (!trimmed) {
+    return "";
+  }
+
+  if (isUuid(trimmed)) {
+    return trimmed;
+  }
+
+  const directMatch = trimmed.match(/\/room\/([0-9a-f-]{36})(?:[/?#]|$)/i);
+  if (directMatch && isUuid(directMatch[1])) {
+    return directMatch[1];
+  }
+
+  const candidateUrl = /^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
+
+  try {
+    const parsed = new URL(candidateUrl);
+    const roomMatch = parsed.pathname.match(/\/room\/([0-9a-f-]{36})\/?$/i);
+    if (roomMatch && isUuid(roomMatch[1])) {
+      return roomMatch[1];
+    }
+  } catch (_error) {
+    return "";
+  }
+
+  return "";
+}
+
 function formatAbsoluteDate(value) {
   return new Date(value).toLocaleString();
 }
@@ -725,17 +755,18 @@ elements.leaveRoomButton.addEventListener("click", () => {
 
 elements.joinRoomForm.addEventListener("submit", (event) => {
   event.preventDefault();
-  const roomKey = elements.roomKeyInput.value.trim();
+  const roomKey = extractRoomKey(elements.roomKeyInput.value);
   if (!isUuid(roomKey)) {
-    alert("Enter a valid UUID room key.");
+    alert("Enter a valid room UUID or PassBoard room link.");
     return;
   }
 
+  elements.roomKeyInput.value = roomKey;
   window.location.assign(`/room/${roomKey}`);
 });
 
-elements.copyRoomLink.addEventListener("click", async () => {
-  await navigator.clipboard.writeText(elements.roomLink.value);
+elements.copyRoomLink.addEventListener("click", async (event) => {
+  await copyWithFeedback(event.currentTarget, elements.roomLink.value);
 });
 
 elements.copyNewItemUsername.addEventListener("click", async (event) => {

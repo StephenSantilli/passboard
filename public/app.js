@@ -1,6 +1,7 @@
 const DEFAULT_GENERATOR_SETTINGS = {
   mode: "random",
-  size: 20,
+  randomSize: 20,
+  wordCount: 3,
   separator: "-",
   uppercase: true,
   lowercase: true,
@@ -9,13 +10,12 @@ const DEFAULT_GENERATOR_SETTINGS = {
   excludeSimilar: true
 };
 
-const GENERATOR_KEY = "password-board-generator-settings";
 const state = {
   roomKey: null,
   actorName: "",
   socket: null,
   boardName: "Untitled Board",
-  generatorSettings: loadGeneratorSettings(),
+  generatorSettings: normalizeGeneratorSettings(),
   wordList: [],
   items: [],
   activeUsers: [],
@@ -70,17 +70,26 @@ function getDisplayNameStorageKey(roomKey) {
   return `password-board-display-name:${roomKey}`;
 }
 
-function loadGeneratorSettings() {
-  try {
-    const saved = JSON.parse(localStorage.getItem(GENERATOR_KEY));
-    return { ...DEFAULT_GENERATOR_SETTINGS, ...saved };
-  } catch (_error) {
-    return { ...DEFAULT_GENERATOR_SETTINGS };
-  }
+function normalizeGeneratorSettings(settings = {}) {
+  const mode = settings.mode === "words" ? "words" : "random";
+  const randomSize = Math.min(64, Math.max(8, Number(settings.randomSize ?? settings.size ?? 20) || 20));
+  const wordCount = Math.min(8, Math.max(2, Number(settings.wordCount ?? settings.size ?? 3) || 3));
+
+  return {
+    mode,
+    randomSize,
+    wordCount,
+    separator: String(settings.separator ?? "-").slice(0, 3) || "-",
+    uppercase: settings.uppercase !== false,
+    lowercase: settings.lowercase !== false,
+    numbers: settings.numbers !== false,
+    symbols: settings.symbols !== false,
+    excludeSimilar: settings.excludeSimilar !== false
+  };
 }
 
-function saveGeneratorSettings() {
-  localStorage.setItem(GENERATOR_KEY, JSON.stringify(state.generatorSettings));
+function getGeneratorSize(settings = state.generatorSettings) {
+  return settings.mode === "words" ? settings.wordCount : settings.randomSize;
 }
 
 async function loadWordList() {
@@ -134,7 +143,7 @@ function generateRandomPassword(settings) {
     throw new Error("Enable at least one character group.");
   }
 
-  const length = Number(settings.size);
+  const length = getGeneratorSize(settings);
   const allChars = groups.join("");
   const passwordChars = [];
 
@@ -158,7 +167,7 @@ function generateRandomPassword(settings) {
 }
 
 function generateWordPassword(settings) {
-  const count = Number(settings.size);
+  const count = getGeneratorSize(settings);
   const separator = String(settings.separator ?? "-").slice(0, 3) || "-";
   const words = [];
   const sourceWords = state.wordList;
@@ -285,6 +294,7 @@ function buildExportPayload() {
     exportedAt: new Date().toISOString(),
     exportedBy: state.actorName,
     boardName: state.boardName,
+    generatorSettings: state.generatorSettings,
     items: state.items.map((item) => ({
       sortOrder: item.sortOrder,
       name: item.name,
@@ -324,6 +334,7 @@ async function importBoardFromFile(file) {
 
   await emit("room:import", {
     boardName: payload.boardName,
+    generatorSettings: payload.generatorSettings,
     items: payload.items
   });
 }
@@ -355,9 +366,11 @@ async function bootstrapRoom(roomKey) {
   state.items = payload.items;
   state.activeUsers = payload.activeUsers || [];
   state.boardName = payload.boardName || "Untitled Board";
+  state.generatorSettings = normalizeGeneratorSettings(payload.generatorSettings);
   state.lastSyncedAt = new Date().toISOString();
   elements.boardNameInput.value = state.boardName;
   document.title = `${state.boardName} | PassBoard`;
+  applyGeneratorSettingsToForm();
   renderActiveUsers();
   renderItems();
 }
@@ -391,9 +404,11 @@ function connectSocket(roomKey, actorName) {
     state.items = payload.items;
     state.activeUsers = payload.activeUsers || [];
     state.boardName = payload.boardName || "Untitled Board";
+    state.generatorSettings = normalizeGeneratorSettings(payload.generatorSettings);
     state.lastSyncedAt = new Date().toISOString();
     elements.boardNameInput.value = state.boardName;
     document.title = `${state.boardName} | PassBoard`;
+    applyGeneratorSettingsToForm();
     renderActiveUsers();
     renderItems();
     setConnectionStatus("live", `Last updated ${formatRelativeDate(state.lastSyncedAt)}`);
@@ -421,6 +436,10 @@ function emit(eventName, payload) {
 }
 
 function applyGeneratorSettingsToForm() {
+  state.generatorSettings = normalizeGeneratorSettings(state.generatorSettings);
+  elements.generatorForm.dataset.randomSize = String(state.generatorSettings.randomSize);
+  elements.generatorForm.dataset.wordCount = String(state.generatorSettings.wordCount);
+
   Object.entries(state.generatorSettings).forEach(([key, value]) => {
     const field = elements.generatorForm.elements.namedItem(key);
     if (!field) {
@@ -449,13 +468,12 @@ function syncGeneratorModeUi() {
   const mode = elements.generatorForm.elements.namedItem("mode").value || "random";
   const slider = elements.generatorSlider;
   const isWords = mode === "words";
+  const settings = readGeneratorSettingsFromForm();
 
   elements.generatorSliderLabel.textContent = isWords ? "Words" : "Length";
   slider.min = isWords ? "2" : "8";
   slider.max = isWords ? "8" : "64";
-  slider.value = String(
-    Math.min(Number(slider.max), Math.max(Number(slider.min), Number(slider.value || state.generatorSettings.size)))
-  );
+  slider.value = String(isWords ? settings.wordCount : settings.randomSize);
   elements.generatorSliderValue.textContent = slider.value;
 
   document.querySelectorAll(".generator-random-option").forEach((node) => {
@@ -463,6 +481,27 @@ function syncGeneratorModeUi() {
   });
   document.querySelectorAll(".generator-word-option").forEach((node) => {
     node.hidden = !isWords;
+  });
+}
+
+function readGeneratorSettingsFromForm() {
+  const form = elements.generatorForm;
+  const previousSettings = normalizeGeneratorSettings(state.generatorSettings);
+  const mode = form.elements.namedItem("mode").value || "random";
+  const activeSliderValue = Number(elements.generatorSlider.value) || getGeneratorSize(previousSettings);
+  const draftRandomSize = Number(form.dataset.randomSize) || previousSettings.randomSize;
+  const draftWordCount = Number(form.dataset.wordCount) || previousSettings.wordCount;
+
+  return normalizeGeneratorSettings({
+    mode,
+    randomSize: mode === "random" ? activeSliderValue : draftRandomSize,
+    wordCount: mode === "words" ? activeSliderValue : draftWordCount,
+    separator: form.elements.namedItem("separator").value,
+    uppercase: form.elements.namedItem("uppercase").checked,
+    lowercase: form.elements.namedItem("lowercase").checked,
+    numbers: form.elements.namedItem("numbers").checked,
+    symbols: form.elements.namedItem("symbols").checked,
+    excludeSimilar: form.elements.namedItem("excludeSimilar").checked
   });
 }
 
@@ -766,6 +805,12 @@ elements.openGeneratorSettings.addEventListener("click", () => {
 });
 
 elements.generatorSlider.addEventListener("input", () => {
+  const mode = elements.generatorForm.elements.namedItem("mode").value || "random";
+  if (mode === "words") {
+    elements.generatorForm.dataset.wordCount = elements.generatorSlider.value;
+  } else {
+    elements.generatorForm.dataset.randomSize = elements.generatorSlider.value;
+  }
   elements.generatorSliderValue.textContent = elements.generatorSlider.value;
 });
 
@@ -775,21 +820,19 @@ Array.from(elements.generatorForm.elements.namedItem("mode")).forEach((radio) =>
 
 elements.generatorForm.addEventListener("submit", (event) => {
   event.preventDefault();
-  const formData = new FormData(elements.generatorForm);
-  state.generatorSettings = {
-    mode: formData.get("mode"),
-    size: Number(formData.get("size")),
-    separator: String(formData.get("separator") || "-"),
-    uppercase: formData.get("uppercase") === "on",
-    lowercase: formData.get("lowercase") === "on",
-    numbers: formData.get("numbers") === "on",
-    symbols: formData.get("symbols") === "on",
-    excludeSimilar: formData.get("excludeSimilar") === "on"
-  };
+  const nextSettings = readGeneratorSettingsFromForm();
 
-  saveGeneratorSettings();
-  elements.generatorDialog.close();
-  setFreshGeneratedPassword(elements.newItemPassword);
+  emit("room:updateGeneratorSettings", {
+    generatorSettings: nextSettings
+  })
+    .then(() => {
+      state.generatorSettings = nextSettings;
+      elements.generatorDialog.close();
+      setFreshGeneratedPassword(elements.newItemPassword);
+    })
+    .catch((error) => {
+      alert(error.message || "Unable to save generator settings.");
+    });
 });
 
 async function initialize() {

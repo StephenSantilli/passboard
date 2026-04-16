@@ -39,6 +39,7 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS rooms (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL DEFAULT 'Untitled Board',
+    generator_settings TEXT NOT NULL DEFAULT '{}',
     updated_at TEXT NOT NULL DEFAULT '',
     updated_by TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL
@@ -86,6 +87,7 @@ function addColumnIfMissing(tableName, columnName, definition) {
 }
 
 addColumnIfMissing("rooms", "name", "TEXT NOT NULL DEFAULT 'Untitled Board'");
+addColumnIfMissing("rooms", "generator_settings", "TEXT NOT NULL DEFAULT '{}'");
 addColumnIfMissing("rooms", "updated_at", "TEXT NOT NULL DEFAULT ''");
 addColumnIfMissing("rooms", "updated_by", "TEXT NOT NULL DEFAULT ''");
 addColumnIfMissing("items", "sort_order", "REAL NOT NULL DEFAULT 0");
@@ -99,12 +101,12 @@ db.exec(`
 `);
 
 const insertRoomStmt = db.prepare(`
-  INSERT OR IGNORE INTO rooms (id, name, updated_at, updated_by, created_at)
-  VALUES (@id, @name, @updatedAt, @updatedBy, @createdAt)
+  INSERT OR IGNORE INTO rooms (id, name, generator_settings, updated_at, updated_by, created_at)
+  VALUES (@id, @name, @generatorSettings, @updatedAt, @updatedBy, @createdAt)
 `);
 
 const selectRoomStmt = db.prepare(`
-  SELECT id, name, updated_at, updated_by, created_at
+  SELECT id, name, generator_settings, updated_at, updated_by, created_at
   FROM rooms
   WHERE id = ?
 `);
@@ -123,6 +125,15 @@ const updateRoomNameStmt = db.prepare(`
   UPDATE rooms
   SET
     name = @name,
+    updated_at = @updatedAt,
+    updated_by = @updatedBy
+  WHERE id = @id
+`);
+
+const updateRoomGeneratorSettingsStmt = db.prepare(`
+  UPDATE rooms
+  SET
+    generator_settings = @generatorSettings,
     updated_at = @updatedAt,
     updated_by = @updatedBy
   WHERE id = @id
@@ -263,11 +274,18 @@ const insertHistoryStmt = db.prepare(`
   )
 `);
 
-const importRoomState = db.transaction(({ roomId, roomKey, actorName, boardName, items }) => {
+const importRoomState = db.transaction(({ roomId, roomKey, actorName, boardName, generatorSettings, items }) => {
+  const updatedAt = nowIso();
   updateRoomNameStmt.run({
     id: roomId,
     name: String(boardName || "Untitled Board").trim().slice(0, 80) || "Untitled Board",
-    updatedAt: nowIso(),
+    updatedAt,
+    updatedBy: actorName
+  });
+  updateRoomGeneratorSettingsStmt.run({
+    id: roomId,
+    generatorSettings: serializeGeneratorSettings(generatorSettings),
+    updatedAt,
     updatedBy: actorName
   });
 
@@ -360,6 +378,36 @@ function nowIso() {
 
 function roomExpiryCutoffIso(referenceTime = Date.now()) {
   return new Date(referenceTime - ROOM_TTL_MS).toISOString();
+}
+
+function normalizeGeneratorSettings(settings = {}) {
+  const mode = settings?.mode === "words" ? "words" : "random";
+  const randomSize = Math.min(64, Math.max(8, Number(settings?.randomSize ?? settings?.size ?? 20) || 20));
+  const wordCount = Math.min(8, Math.max(2, Number(settings?.wordCount ?? settings?.size ?? 3) || 3));
+
+  return {
+    mode,
+    randomSize,
+    wordCount,
+    separator: String(settings?.separator ?? "-").slice(0, 3) || "-",
+    uppercase: settings?.uppercase !== false,
+    lowercase: settings?.lowercase !== false,
+    numbers: settings?.numbers !== false,
+    symbols: settings?.symbols !== false,
+    excludeSimilar: settings?.excludeSimilar !== false
+  };
+}
+
+function serializeGeneratorSettings(settings = {}) {
+  return JSON.stringify(normalizeGeneratorSettings(settings));
+}
+
+function parseGeneratorSettings(serialized) {
+  try {
+    return normalizeGeneratorSettings(serialized ? JSON.parse(serialized) : {});
+  } catch (_error) {
+    return normalizeGeneratorSettings();
+  }
 }
 
 function isRoomExpired(room, referenceTime = Date.now()) {
@@ -455,6 +503,7 @@ function ensureRoomExists(roomKey) {
   insertRoomStmt.run({
     id,
     name: "Untitled Board",
+    generatorSettings: serializeGeneratorSettings(),
     updatedAt: createdAt,
     updatedBy: "",
     createdAt
@@ -514,6 +563,7 @@ function mapRoomState(roomKey) {
   return {
     roomId: room.id,
     boardName: room.name,
+    generatorSettings: parseGeneratorSettings(room.generator_settings),
     boardUpdatedAt: room.updated_at,
     boardUpdatedBy: room.updated_by,
     createdAt: room.created_at,
@@ -695,6 +745,22 @@ io.on("connection", (socket) => {
     }
   });
 
+  socket.on("room:updateGeneratorSettings", (payload, callback = () => {}) => {
+    try {
+      updateRoomGeneratorSettingsStmt.run({
+        id: roomId,
+        generatorSettings: serializeGeneratorSettings(payload?.generatorSettings),
+        updatedAt: nowIso(),
+        updatedBy: actorName
+      });
+
+      emitRoomState(roomKey);
+      callback({ ok: true });
+    } catch (error) {
+      callback({ ok: false, error: error.message });
+    }
+  });
+
   socket.on("room:import", (payload, callback = () => {}) => {
     try {
       const normalizedItems = normalizeImportedItems(payload?.items);
@@ -703,6 +769,7 @@ io.on("connection", (socket) => {
         roomKey,
         actorName,
         boardName: payload?.boardName,
+        generatorSettings: payload?.generatorSettings,
         items: normalizedItems
       });
 

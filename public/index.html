@@ -78,6 +78,37 @@
         </a>
       </header>
 
+      <section id="security-notes" class="panel landing-panel security-notes">
+        <div class="panel-header">
+          <div>
+            <p class="eyebrow">Security Notes</p>
+            <h2>This is a tool for use in competitions. Not a password manager.</h2>
+          </div>
+        </div>
+        <div class="security-notes-grid">
+          <article class="security-note-card">
+            <h3>Room link = room access</h3>
+            <p>
+              Anyone with the room UUID can open the board and decrypt its passwords, so
+              treat the link itself like a secret.
+            </p>
+          </article>
+          <article class="security-note-card">
+            <h3>Generator is convenience-focused</h3>
+            <p>
+              Built-in password generation is meant to be fast and useful during competitions,
+              but it is not positioned as a replacement for a dedicated cryptographic password manager.
+            </p>
+          </article>
+          <article class="security-note-card">
+            <h3>Boards expire automatically</h3>
+            <p>
+              Room data is deleted after 7 days, which helps reduce stale credential exposure after an event ends.
+            </p>
+          </article>
+        </div>
+      </section>
+
       <main id="board-view" class="board-view hidden">
         <section class="room-banner">
           <div>

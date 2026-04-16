@@ -143,6 +143,10 @@ input:focus {
   border-radius: 28px;
 }
 
+.landing-panel {
+  margin-top: 1.5rem;
+}
+
 .hero {
   position: relative;
   display: grid;
@@ -321,6 +325,31 @@ h1 {
 
 .panel-header h2 {
   margin-bottom: 0;
+}
+
+.security-notes-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 1rem;
+}
+
+.security-note-card {
+  min-width: 0;
+  padding: 1rem 1.1rem;
+  border-radius: 20px;
+  background: rgba(8, 18, 28, 0.74);
+  border: 1px solid rgba(145, 210, 255, 0.1);
+}
+
+.security-note-card h3 {
+  margin: 0 0 0.55rem;
+  font-size: 1rem;
+}
+
+.security-note-card p {
+  margin-bottom: 0;
+  color: var(--muted);
+  line-height: 1.55;
 }
 
 .primary {
@@ -686,6 +715,10 @@ output {
   .hero,
   .board-columns,
   .board-row {
+    grid-template-columns: 1fr;
+  }
+
+  .security-notes-grid {
     grid-template-columns: 1fr;
   }
 

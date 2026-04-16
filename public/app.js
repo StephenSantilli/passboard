@@ -32,7 +32,6 @@ const elements = {
   boardView: document.getElementById("board-view"),
   hero: document.querySelector(".hero"),
   securityNotes: document.getElementById("security-notes"),
-  featuresSection: document.getElementById("features-section"),
   roomKeyInput: document.getElementById("room-key-input"),
   joinRoomForm: document.getElementById("join-room-form"),
   createRoomButton: document.getElementById("create-room-button"),
@@ -346,7 +345,6 @@ function showBoard(roomKey, actorName) {
   state.actorName = actorName;
   elements.hero.classList.add("hidden");
   elements.securityNotes.classList.add("hidden");
-  elements.featuresSection.classList.add("hidden");
   elements.roomNavbar.classList.remove("hidden");
   elements.boardView.classList.remove("hidden");
   elements.roomLink.value = new URL(`/room/${roomKey}`, window.location.origin).toString();

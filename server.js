@@ -11,6 +11,7 @@ const { v4: uuidv4, validate: isUuid } = require("uuid");
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
+  maxHttpBufferSize: 256 * 1024,
   cors: {
     origin: true,
     methods: ["GET", "POST"]
@@ -26,6 +27,26 @@ const ROOM_KEY_SALT = "room-key-derivation-v1";
 const ROOM_KEY_INFO = "ctf-password-board";
 const ROOM_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const ROOM_CLEANUP_INTERVAL_MS = 60 * 60 * 1000;
+const MAX_BOARD_NAME_LENGTH = 80;
+const MAX_ACTOR_NAME_LENGTH = 40;
+const MAX_ITEM_NAME_LENGTH = 120;
+const MAX_PORT_LENGTH = 24;
+const MAX_USERNAME_LENGTH = 120;
+const MAX_PASSWORD_LENGTH = 512;
+const MAX_ITEMS_PER_ROOM = 250;
+const MAX_HISTORY_ENTRIES_PER_ITEM = 100;
+const MAX_IMPORT_ITEMS = MAX_ITEMS_PER_ROOM;
+const MAX_IMPORT_JSON_BYTES = 512 * 1024;
+const HTTP_RATE_LIMIT_WINDOW_MS = 60 * 1000;
+const HTTP_NEW_ROOM_LIMIT = 20;
+const HTTP_BOOTSTRAP_LIMIT = 120;
+const SOCKET_CONNECT_WINDOW_MS = 60 * 1000;
+const SOCKET_CONNECT_LIMIT = 60;
+const SOCKET_IMPORT_WINDOW_MS = 5 * 60 * 1000;
+const SOCKET_IMPORT_LIMIT = 5;
+const MUTATION_WINDOW_MS = 10 * 1000;
+const MUTATION_LIMIT_PER_ACTOR = 40;
+const MUTATION_LIMIT_PER_ROOM = 120;
 
 app.disable("x-powered-by");
 
@@ -40,6 +61,8 @@ db.exec(`
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL DEFAULT 'Untitled Board',
     generator_settings TEXT NOT NULL DEFAULT '{}',
+    last_imported_at TEXT NOT NULL DEFAULT '',
+    last_imported_by TEXT NOT NULL DEFAULT '',
     updated_at TEXT NOT NULL DEFAULT '',
     updated_by TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL
@@ -56,8 +79,10 @@ db.exec(`
     password_iv TEXT,
     password_tag TEXT,
     created_at TEXT NOT NULL,
+    created_by TEXT NOT NULL DEFAULT '',
     updated_at TEXT NOT NULL,
     updated_by TEXT NOT NULL DEFAULT '',
+    password_rotation_count INTEGER NOT NULL DEFAULT 0,
     FOREIGN KEY(room_id) REFERENCES rooms(id) ON DELETE CASCADE
   );
 
@@ -88,10 +113,14 @@ function addColumnIfMissing(tableName, columnName, definition) {
 
 addColumnIfMissing("rooms", "name", "TEXT NOT NULL DEFAULT 'Untitled Board'");
 addColumnIfMissing("rooms", "generator_settings", "TEXT NOT NULL DEFAULT '{}'");
+addColumnIfMissing("rooms", "last_imported_at", "TEXT NOT NULL DEFAULT ''");
+addColumnIfMissing("rooms", "last_imported_by", "TEXT NOT NULL DEFAULT ''");
 addColumnIfMissing("rooms", "updated_at", "TEXT NOT NULL DEFAULT ''");
 addColumnIfMissing("rooms", "updated_by", "TEXT NOT NULL DEFAULT ''");
 addColumnIfMissing("items", "sort_order", "REAL NOT NULL DEFAULT 0");
+addColumnIfMissing("items", "created_by", "TEXT NOT NULL DEFAULT ''");
 addColumnIfMissing("items", "updated_by", "TEXT NOT NULL DEFAULT ''");
+addColumnIfMissing("items", "password_rotation_count", "INTEGER NOT NULL DEFAULT 0");
 addColumnIfMissing("password_history", "created_by", "TEXT NOT NULL DEFAULT ''");
 
 db.exec(`
@@ -106,7 +135,7 @@ const insertRoomStmt = db.prepare(`
 `);
 
 const selectRoomStmt = db.prepare(`
-  SELECT id, name, generator_settings, updated_at, updated_by, created_at
+  SELECT id, name, generator_settings, last_imported_at, last_imported_by, updated_at, updated_by, created_at
   FROM rooms
   WHERE id = ?
 `);
@@ -139,6 +168,16 @@ const updateRoomGeneratorSettingsStmt = db.prepare(`
   WHERE id = @id
 `);
 
+const updateRoomImportAuditStmt = db.prepare(`
+  UPDATE rooms
+  SET
+    last_imported_at = @lastImportedAt,
+    last_imported_by = @lastImportedBy,
+    updated_at = @updatedAt,
+    updated_by = @updatedBy
+  WHERE id = @id
+`);
+
 const selectItemsStmt = db.prepare(`
   SELECT
     i.id,
@@ -150,8 +189,10 @@ const selectItemsStmt = db.prepare(`
     i.password_iv,
     i.password_tag,
     i.created_at,
+    i.created_by,
     i.updated_at,
     i.updated_by,
+    i.password_rotation_count,
     (
       SELECT json_group_array(
         json_object(
@@ -184,8 +225,10 @@ const insertItemStmt = db.prepare(`
     password_iv,
     password_tag,
     created_at,
+    created_by,
     updated_at,
-    updated_by
+    updated_by,
+    password_rotation_count
   ) VALUES (
     @id,
     @roomId,
@@ -197,8 +240,10 @@ const insertItemStmt = db.prepare(`
     @passwordIv,
     @passwordTag,
     @createdAt,
+    @createdBy,
     @updatedAt,
-    @updatedBy
+    @updatedBy,
+    @passwordRotationCount
   )
 `);
 
@@ -210,6 +255,12 @@ const selectItemStmt = db.prepare(`
 
 const selectMaxSortOrderStmt = db.prepare(`
   SELECT COALESCE(MAX(sort_order), 0) AS maxSortOrder
+  FROM items
+  WHERE room_id = ?
+`);
+
+const selectItemCountStmt = db.prepare(`
+  SELECT COUNT(*) AS itemCount
   FROM items
   WHERE room_id = ?
 `);
@@ -232,7 +283,8 @@ const updateItemPasswordStmt = db.prepare(`
     password_iv = @passwordIv,
     password_tag = @passwordTag,
     updated_at = @updatedAt,
-    updated_by = @updatedBy
+    updated_by = @updatedBy,
+    password_rotation_count = @passwordRotationCount
   WHERE id = @id AND room_id = @roomId
 `);
 
@@ -274,11 +326,27 @@ const insertHistoryStmt = db.prepare(`
   )
 `);
 
+const trimHistoryStmt = db.prepare(`
+  DELETE FROM password_history
+  WHERE item_id = @itemId
+    AND id IN (
+      SELECT id
+      FROM password_history
+      WHERE item_id = @itemId
+      ORDER BY created_at DESC, rowid DESC
+      LIMIT -1 OFFSET @keepCount
+    )
+`);
+
+const httpRateLimitStore = new Map();
+const socketRateLimitStore = new Map();
+const mutationRateLimitStore = new Map();
+
 const importRoomState = db.transaction(({ roomId, roomKey, actorName, boardName, generatorSettings, items }) => {
   const updatedAt = nowIso();
   updateRoomNameStmt.run({
     id: roomId,
-    name: String(boardName || "Untitled Board").trim().slice(0, 80) || "Untitled Board",
+    name: normalizeBoardName(boardName),
     updatedAt,
     updatedBy: actorName
   });
@@ -288,29 +356,44 @@ const importRoomState = db.transaction(({ roomId, roomKey, actorName, boardName,
     updatedAt,
     updatedBy: actorName
   });
+  updateRoomImportAuditStmt.run({
+    id: roomId,
+    lastImportedAt: updatedAt,
+    lastImportedBy: actorName,
+    updatedAt,
+    updatedBy: actorName
+  });
 
   deleteItemsByRoomStmt.run(roomId);
 
   items.forEach((item, index) => {
     const createdAt = String(item.createdAt || nowIso());
+    const createdBy = normalizeActorName(item.createdBy) || actorName;
     const updatedAt = String(item.updatedAt || createdAt);
     const updatedBy = normalizeActorName(item.updatedBy) || actorName;
     const encrypted = encryptPassword(roomKey, String(item.password || ""));
     const sortOrder = Number.isFinite(Number(item.sortOrder)) ? Number(item.sortOrder) : index + 1;
+    const passwordRotationCount = Number.isFinite(Number(item.passwordRotationCount))
+      ? Math.max(0, Number(item.passwordRotationCount))
+      : Array.isArray(item.history)
+        ? item.history.length
+        : 0;
 
     insertItemStmt.run({
       id: uuidv4(),
       roomId,
       sortOrder,
-      name: String(item.name || "").trim(),
-      port: String(item.port || "").trim(),
-      username: String(item.username || "").trim(),
+      name: item.name,
+      port: item.port,
+      username: item.username,
       passwordCipher: encrypted.cipher,
       passwordIv: encrypted.iv,
       passwordTag: encrypted.tag,
       createdAt,
+      createdBy,
       updatedAt,
-      updatedBy
+      updatedBy,
+      passwordRotationCount
     });
 
     const insertedItem = db.prepare(`
@@ -343,18 +426,24 @@ function normalizeImportedItems(items) {
     throw new Error("Import file must contain an items array.");
   }
 
+  if (items.length > MAX_IMPORT_ITEMS) {
+    throw new Error(`Import exceeds the ${MAX_IMPORT_ITEMS}-item room limit.`);
+  }
+
   return items.map((item) => ({
     sortOrder: item?.sortOrder,
-    name: String(item?.name || "").trim(),
-    port: String(item?.port || "").trim(),
-    username: String(item?.username || "").trim(),
-    password: String(item?.password || ""),
+    name: normalizeItemName(item?.name),
+    port: normalizePort(item?.port),
+    username: normalizeUsername(item?.username),
+    password: normalizePassword(item?.password),
     createdAt: item?.createdAt,
+    createdBy: item?.createdBy,
     updatedAt: item?.updatedAt,
     updatedBy: item?.updatedBy,
+    passwordRotationCount: item?.passwordRotationCount,
     history: Array.isArray(item?.history)
-      ? item.history.map((entry) => ({
-          password: String(entry?.password || ""),
+      ? item.history.slice(0, MAX_HISTORY_ENTRIES_PER_ITEM).map((entry) => ({
+          password: normalizePassword(entry?.password),
           createdAt: entry?.createdAt,
           createdBy: entry?.createdBy
         }))
@@ -423,7 +512,143 @@ function cleanupExpiredRooms(referenceTime = Date.now()) {
 }
 
 function normalizeActorName(name) {
-  return String(name || "").trim().slice(0, 40);
+  return String(name || "").trim().slice(0, MAX_ACTOR_NAME_LENGTH);
+}
+
+function normalizeBoundedString(value, { fieldName, maxLength, allowEmpty = true, trim = true }) {
+  const normalized = trim ? String(value ?? "").trim() : String(value ?? "");
+  if (!allowEmpty && !normalized) {
+    throw new Error(`${fieldName} is required.`);
+  }
+  if (normalized.length > maxLength) {
+    throw new Error(`${fieldName} must be ${maxLength} characters or fewer.`);
+  }
+  return normalized;
+}
+
+function normalizeBoardName(value) {
+  return normalizeBoundedString(value, {
+    fieldName: "Board name",
+    maxLength: MAX_BOARD_NAME_LENGTH
+  }) || "Untitled Board";
+}
+
+function normalizeItemName(value) {
+  return normalizeBoundedString(value, {
+    fieldName: "Item name",
+    maxLength: MAX_ITEM_NAME_LENGTH,
+    allowEmpty: false
+  });
+}
+
+function normalizePort(value) {
+  return normalizeBoundedString(value, {
+    fieldName: "Port",
+    maxLength: MAX_PORT_LENGTH
+  });
+}
+
+function normalizeUsername(value) {
+  return normalizeBoundedString(value, {
+    fieldName: "Username",
+    maxLength: MAX_USERNAME_LENGTH
+  });
+}
+
+function normalizePassword(value) {
+  return normalizeBoundedString(value, {
+    fieldName: "Password",
+    maxLength: MAX_PASSWORD_LENGTH,
+    trim: false
+  });
+}
+
+function getRoomItemCount(roomId) {
+  return selectItemCountStmt.get(roomId).itemCount;
+}
+
+function requireRoomCapacity(roomId, additionalItems = 1) {
+  if (getRoomItemCount(roomId) + additionalItems > MAX_ITEMS_PER_ROOM) {
+    throw new Error(`Rooms are limited to ${MAX_ITEMS_PER_ROOM} items.`);
+  }
+}
+
+function requireImportCapacity(items) {
+  if (items.length > MAX_ITEMS_PER_ROOM) {
+    throw new Error(`Rooms are limited to ${MAX_ITEMS_PER_ROOM} items.`);
+  }
+}
+
+function pruneRateLimitStore(store, now) {
+  if (store.size <= 5000) {
+    return;
+  }
+
+  for (const [key, entry] of store.entries()) {
+    if (entry.resetAt <= now) {
+      store.delete(key);
+    }
+  }
+}
+
+function consumeRateLimit(store, key, limit, windowMs) {
+  const now = Date.now();
+  pruneRateLimitStore(store, now);
+  const existing = store.get(key);
+  if (!existing || existing.resetAt <= now) {
+    store.set(key, { count: 1, resetAt: now + windowMs });
+    return true;
+  }
+
+  if (existing.count >= limit) {
+    return false;
+  }
+
+  existing.count += 1;
+  return true;
+}
+
+function getRequestRateLimitKey(req, scope) {
+  return `${scope}:${req.ip || req.socket.remoteAddress || "unknown"}`;
+}
+
+function requireHttpRateLimit(req, scope, limit, windowMs) {
+  if (!consumeRateLimit(httpRateLimitStore, getRequestRateLimitKey(req, scope), limit, windowMs)) {
+    const error = new Error("Too many requests. Please slow down.");
+    error.statusCode = 429;
+    throw error;
+  }
+}
+
+function getSocketRateLimitKey(socket, scope) {
+  return `${scope}:${socket.handshake.address || socket.conn.remoteAddress || "unknown"}`;
+}
+
+function requireSocketRateLimit(socket, scope, limit, windowMs) {
+  if (!consumeRateLimit(socketRateLimitStore, getSocketRateLimitKey(socket, scope), limit, windowMs)) {
+    throw new Error("Too many requests. Please slow down.");
+  }
+}
+
+function requireMutationRateLimit(socket, roomId, scope) {
+  const actorName = socket.data.actorName || "unknown";
+  const actorKey = `actor:${roomId}:${actorName}:${scope}`;
+  const roomKey = `room:${roomId}:${scope}`;
+
+  if (!consumeRateLimit(mutationRateLimitStore, actorKey, MUTATION_LIMIT_PER_ACTOR, MUTATION_WINDOW_MS)) {
+    throw new Error("You are making changes too quickly. Please slow down.");
+  }
+
+  if (!consumeRateLimit(mutationRateLimitStore, roomKey, MUTATION_LIMIT_PER_ROOM, MUTATION_WINDOW_MS)) {
+    throw new Error("This board is receiving changes too quickly. Please slow down.");
+  }
+}
+
+function validateImportPayload(payload) {
+  const serialized = JSON.stringify(payload ?? {});
+  if (Buffer.byteLength(serialized, "utf8") > MAX_IMPORT_JSON_BYTES) {
+    throw new Error("Import file is too large.");
+  }
 }
 
 function ensureRoomKey(roomKey) {
@@ -564,6 +789,8 @@ function mapRoomState(roomKey) {
     roomId: room.id,
     boardName: room.name,
     generatorSettings: parseGeneratorSettings(room.generator_settings),
+    lastImportedAt: room.last_imported_at,
+    lastImportedBy: room.last_imported_by,
     boardUpdatedAt: room.updated_at,
     boardUpdatedBy: room.updated_by,
     createdAt: room.created_at,
@@ -580,9 +807,11 @@ function mapRoomState(roomKey) {
         tag: row.password_tag
       }),
       createdAt: row.created_at,
+      createdBy: row.created_by,
       updatedAt: row.updated_at,
       updatedBy: row.updated_by,
-      history: parseHistory(row.history_json).map((entry) => ({
+      passwordRotationCount: row.password_rotation_count,
+      history: parseHistory(row.history_json).reverse().map((entry) => ({
         id: entry.id,
         password: decryptPassword(roomKey, {
           cipher: entry.password_cipher,
@@ -617,7 +846,8 @@ const setItemPasswordWithHistory = db.transaction(
         passwordIv: existing.password_iv,
         passwordTag: existing.password_tag,
         updatedAt,
-        updatedBy
+        updatedBy,
+        passwordRotationCount: existing.password_rotation_count || 0
       });
       return;
     }
@@ -633,6 +863,10 @@ const setItemPasswordWithHistory = db.transaction(
         createdAt: updatedAt,
         createdBy: updatedBy
       });
+      trimHistoryStmt.run({
+        itemId,
+        keepCount: MAX_HISTORY_ENTRIES_PER_ITEM
+      });
     }
 
     const encrypted = encryptPassword(roomKey, nextPassword);
@@ -643,12 +877,13 @@ const setItemPasswordWithHistory = db.transaction(
       passwordIv: encrypted.iv,
       passwordTag: encrypted.tag,
       updatedAt,
-      updatedBy
+      updatedBy,
+      passwordRotationCount: (existing.password_rotation_count || 0) + 1
     });
   }
 );
 
-app.use(express.json());
+app.use(express.json({ limit: "256kb" }));
 app.use((req, res, next) => {
   res.setHeader("X-Content-Type-Options", "nosniff");
   res.setHeader("Referrer-Policy", "no-referrer");
@@ -662,23 +897,52 @@ app.use((req, res, next) => {
 app.use(express.static(path.join(__dirname, "public")));
 
 app.get("/api/rooms/:roomKey/bootstrap", (req, res) => {
-  const { roomKey } = req.params;
-  if (!ensureRoomKey(roomKey)) {
-    return res.status(400).json({ error: "Invalid room key." });
-  }
+  try {
+    requireHttpRateLimit(req, "bootstrap", HTTP_BOOTSTRAP_LIMIT, HTTP_RATE_LIMIT_WINDOW_MS);
+    const { roomKey } = req.params;
+    if (!ensureRoomKey(roomKey)) {
+      return res.status(400).json({ error: "Invalid room key." });
+    }
 
-  const room = requireActiveRoom(roomKey);
-  if (!room) {
-    return res.status(404).json({ error: "Room not found or has expired." });
-  }
+    const room = requireActiveRoom(roomKey);
+    if (!room) {
+      return res.status(404).json({ error: "Room not found or has expired." });
+    }
 
-  return res.json(mapRoomState(roomKey));
+    return res.json(mapRoomState(roomKey));
+  } catch (error) {
+    return res.status(error.statusCode || 500).json({ error: error.message || "Request failed." });
+  }
 });
 
-app.get("/api/rooms/new", (_req, res) => {
-  const roomKey = uuidv4();
-  ensureRoomExists(roomKey);
-  return res.json({ roomKey, url: `/room/${roomKey}` });
+app.get("/api/rooms/new", (req, res) => {
+  try {
+    requireHttpRateLimit(req, "new-room", HTTP_NEW_ROOM_LIMIT, HTTP_RATE_LIMIT_WINDOW_MS);
+    const roomKey = uuidv4();
+    ensureRoomExists(roomKey);
+    return res.json({ roomKey, url: `/room/${roomKey}` });
+  } catch (error) {
+    return res.status(error.statusCode || 500).json({ error: error.message || "Request failed." });
+  }
+});
+
+app.use((error, _req, res, next) => {
+  if (!error) {
+    next();
+    return;
+  }
+
+  if (error.type === "entity.too.large" || error.status === 413) {
+    res.status(413).json({ error: "Request body is too large." });
+    return;
+  }
+
+  if (error instanceof SyntaxError && "body" in error) {
+    res.status(400).json({ error: "Request body is not valid JSON." });
+    return;
+  }
+
+  res.status(error.statusCode || 500).json({ error: error.message || "Request failed." });
 });
 
 app.get("/room/:roomKey", (req, res) => {
@@ -697,6 +961,9 @@ app.get("/room/:roomKey", (req, res) => {
 io.use((socket, next) => {
   const roomKey = socket.handshake.auth?.roomKey;
   const actorName = normalizeActorName(socket.handshake.auth?.actorName);
+  if (!consumeRateLimit(socketRateLimitStore, getSocketRateLimitKey(socket, "connect"), SOCKET_CONNECT_LIMIT, SOCKET_CONNECT_WINDOW_MS)) {
+    return next(new Error("Too many connection attempts. Please slow down."));
+  }
   if (!ensureRoomKey(roomKey)) {
     return next(new Error("Invalid room key."));
   }
@@ -730,7 +997,8 @@ io.on("connection", (socket) => {
 
   socket.on("room:updateName", (payload, callback = () => {}) => {
     try {
-      const name = String(payload?.name || "").trim().slice(0, 80) || "Untitled Board";
+      requireMutationRateLimit(socket, roomId, "room-update");
+      const name = normalizeBoardName(payload?.name);
       updateRoomNameStmt.run({
         id: roomId,
         name,
@@ -747,6 +1015,7 @@ io.on("connection", (socket) => {
 
   socket.on("room:updateGeneratorSettings", (payload, callback = () => {}) => {
     try {
+      requireMutationRateLimit(socket, roomId, "room-settings");
       updateRoomGeneratorSettingsStmt.run({
         id: roomId,
         generatorSettings: serializeGeneratorSettings(payload?.generatorSettings),
@@ -763,7 +1032,11 @@ io.on("connection", (socket) => {
 
   socket.on("room:import", (payload, callback = () => {}) => {
     try {
+      requireMutationRateLimit(socket, roomId, "room-import");
+      requireSocketRateLimit(socket, "room-import", SOCKET_IMPORT_LIMIT, SOCKET_IMPORT_WINDOW_MS);
+      validateImportPayload(payload);
       const normalizedItems = normalizeImportedItems(payload?.items);
+      requireImportCapacity(normalizedItems);
       importRoomState({
         roomId,
         roomKey,
@@ -782,6 +1055,7 @@ io.on("connection", (socket) => {
 
   socket.on("items:reorder", (payload, callback = () => {}) => {
     try {
+      requireMutationRateLimit(socket, roomId, "reorder");
       const orderedIds = Array.isArray(payload?.orderedIds)
         ? payload.orderedIds.map((id) => String(id))
         : [];
@@ -808,8 +1082,10 @@ io.on("connection", (socket) => {
 
   socket.on("item:create", (payload, callback = () => {}) => {
     try {
+      requireMutationRateLimit(socket, roomId, "item-create");
       const createdAt = nowIso();
-      const password = String(payload?.password || "");
+      requireRoomCapacity(roomId);
+      const password = normalizePassword(payload?.password);
       const encrypted = encryptPassword(roomKey, password);
       const nextSortOrder = selectMaxSortOrderStmt.get(roomId).maxSortOrder + 1;
 
@@ -817,15 +1093,17 @@ io.on("connection", (socket) => {
         id: uuidv4(),
         roomId,
         sortOrder: nextSortOrder,
-        name: String(payload?.name || "").trim(),
-        port: String(payload?.port || "").trim(),
-        username: String(payload?.username || "").trim(),
+        name: normalizeItemName(payload?.name),
+        port: normalizePort(payload?.port),
+        username: normalizeUsername(payload?.username),
         passwordCipher: encrypted.cipher,
         passwordIv: encrypted.iv,
         passwordTag: encrypted.tag,
         createdAt,
+        createdBy: actorName,
         updatedAt: createdAt,
-        updatedBy: actorName
+        updatedBy: actorName,
+        passwordRotationCount: 0
       });
 
       emitRoomState(roomKey);
@@ -837,13 +1115,14 @@ io.on("connection", (socket) => {
 
   socket.on("item:updateMeta", (payload, callback = () => {}) => {
     try {
+      requireMutationRateLimit(socket, roomId, "item-update");
       const itemId = String(payload?.id || "");
       updateItemFieldsStmt.run({
         id: itemId,
         roomId,
-        name: String(payload?.name || "").trim(),
-        port: String(payload?.port || "").trim(),
-        username: String(payload?.username || "").trim(),
+        name: normalizeItemName(payload?.name),
+        port: normalizePort(payload?.port),
+        username: normalizeUsername(payload?.username),
         updatedAt: nowIso(),
         updatedBy: actorName
       });
@@ -857,11 +1136,12 @@ io.on("connection", (socket) => {
 
   socket.on("item:updatePassword", (payload, callback = () => {}) => {
     try {
+      requireMutationRateLimit(socket, roomId, "password-update");
       setItemPasswordWithHistory({
         itemId: String(payload?.id || ""),
         roomId,
         roomKey,
-        nextPassword: String(payload?.password || ""),
+        nextPassword: normalizePassword(payload?.password),
         updatedAt: nowIso(),
         updatedBy: actorName
       });
@@ -875,9 +1155,35 @@ io.on("connection", (socket) => {
 
   socket.on("item:delete", (payload, callback = () => {}) => {
     try {
+      requireMutationRateLimit(socket, roomId, "item-delete");
       deleteItemStmt.run(String(payload?.id || ""), roomId);
       emitRoomState(roomKey);
       callback({ ok: true });
+    } catch (error) {
+      callback({ ok: false, error: error.message });
+    }
+  });
+
+  socket.on("room:destroy", (_payload, callback = () => {}) => {
+    try {
+      requireMutationRateLimit(socket, roomId, "room-destroy");
+      deleteRoomStmt.run(roomId);
+      io.to(roomId).emit("room:destroyed", {
+        destroyedAt: nowIso(),
+        destroyedBy: actorName
+      });
+      callback({ ok: true });
+
+      setTimeout(() => {
+        const roomSockets = io.sockets.adapter.rooms.get(roomId);
+        if (!roomSockets) {
+          return;
+        }
+
+        roomSockets.forEach((socketId) => {
+          io.sockets.sockets.get(socketId)?.disconnect(true);
+        });
+      }, 25);
     } catch (error) {
       callback({ ok: false, error: error.message });
     }
@@ -896,7 +1202,7 @@ if (require.main === module) {
   cleanupTimer.unref();
 
   server.listen(PORT, HOST, () => {
-    console.log(`Password board listening on http://${HOST}:${PORT}`);
+    console.log("PassBoard server listening.");
   });
 }
 

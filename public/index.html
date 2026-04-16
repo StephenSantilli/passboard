@@ -15,6 +15,7 @@
           <button id="leave-room-button" class="ghost">Leave Room</button>
         </div>
         <div class="nav-right">
+          <button id="destroy-room-button" class="danger">Destroy Room</button>
           <a
             href="https://github.com/StephenSantilli/passboard"
             class="icon-link"
@@ -121,6 +122,7 @@
               maxlength="80"
             />
             <p class="signed-in-as">Signed in as <strong id="signed-in-name"></strong></p>
+            <p id="board-audit-meta" class="board-audit-meta hidden"></p>
             <div class="active-users-block">
               <p class="eyebrow">Active Users</p>
               <div id="active-users-list" class="active-users-list"></div>
@@ -328,6 +330,7 @@
         </div>
         <div class="card-footer">
           <span data-meta="updated-at"></span>
+          <span data-meta="audit" class="item-audit-meta"></span>
         </div>
         <div class="row-actions">
           <button data-action="delete-item" class="danger">Delete</button>

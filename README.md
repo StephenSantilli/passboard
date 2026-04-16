@@ -18,7 +18,8 @@ Real-time room-based password sharing for teams in cybersecurity competitions. A
 
 - Use HTTPS in deployment so the UUID room link and password traffic are encrypted in transit.
 - Anyone with the room UUID can access the room, so treat the link as the secret.
-- The database stores only encrypted passwords and a hash of the room UUID, not the raw room key.
+- Passwords are encrypted at rest, but PassBoard is not a zero-knowledge or end-to-end encrypted system. The server can decrypt room contents by design.
+- The database stores encrypted passwords and a hash of the room UUID, not the raw room key itself.
 - Rooms are deleted 7 days from their creation date.
 - The built-in password generator is convenience-focused, especially in word mode, so do not assume generated values meet strong cryptographic password requirements.
 

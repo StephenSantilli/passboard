@@ -10,6 +10,8 @@ const DEFAULT_GENERATOR_SETTINGS = {
   excludeSimilar: true
 };
 
+const HISTORY_PREVIEW_LIMIT = 25;
+
 const state = {
   roomKey: null,
   actorName: "",
@@ -19,16 +21,20 @@ const state = {
   wordList: [],
   items: [],
   activeUsers: [],
+  lastImportedAt: "",
+  lastImportedBy: "",
   passwordsHidden: false,
   lastSyncedAt: null,
   connectionState: "connecting",
-  draggedItemId: null
+  draggedItemId: null,
+  historyVisibleCounts: {}
 };
 
 const elements = {
   roomNavbar: document.getElementById("room-navbar"),
   homeButton: document.getElementById("home-button"),
   leaveRoomButton: document.getElementById("leave-room-button"),
+  destroyRoomButton: document.getElementById("destroy-room-button"),
   boardView: document.getElementById("board-view"),
   hero: document.querySelector(".hero"),
   securityNotes: document.getElementById("security-notes"),
@@ -45,6 +51,7 @@ const elements = {
   importBoardButton: document.getElementById("import-board-button"),
   importBoardInput: document.getElementById("import-board-input"),
   boardNameInput: document.getElementById("board-name-input"),
+  boardAuditMeta: document.getElementById("board-audit-meta"),
   signedInName: document.getElementById("signed-in-name"),
   activeUsersList: document.getElementById("active-users-list"),
   createItemForm: document.getElementById("create-item-form"),
@@ -258,6 +265,22 @@ function formatRelativeDate(value) {
   return new Intl.RelativeTimeFormat(undefined, { numeric: "auto" }).format(diffDays, "day");
 }
 
+function formatFilenameTimestamp(value = new Date()) {
+  const date = new Date(value);
+  const parts = [
+    date.getFullYear(),
+    String(date.getMonth() + 1).padStart(2, "0"),
+    String(date.getDate()).padStart(2, "0")
+  ];
+  const time = [
+    String(date.getHours()).padStart(2, "0"),
+    String(date.getMinutes()).padStart(2, "0"),
+    String(date.getSeconds()).padStart(2, "0")
+  ];
+
+  return `${parts.join("")}-${time.join("")}`;
+}
+
 function updateRelativeTimestamps() {
   document.querySelectorAll("[data-timestamp-value]").forEach((node) => {
     const timestamp = node.dataset.timestampValue;
@@ -265,6 +288,11 @@ function updateRelativeTimestamps() {
     node.textContent = `Updated ${formatRelativeDate(timestamp)}${actor ? ` by ${actor}` : ""}`;
     node.title = formatAbsoluteDate(timestamp);
   });
+
+  if (state.lastImportedAt && !elements.boardAuditMeta.classList.contains("hidden")) {
+    elements.boardAuditMeta.textContent = `Last imported ${formatRelativeDate(state.lastImportedAt)}${state.lastImportedBy ? ` by ${state.lastImportedBy}` : ""}`;
+    elements.boardAuditMeta.title = formatAbsoluteDate(state.lastImportedAt);
+  }
 
   if (state.connectionState === "live" && state.lastSyncedAt) {
     elements.connectionDetail.textContent = `Last updated ${formatRelativeDate(state.lastSyncedAt)}`;
@@ -319,6 +347,18 @@ function renderActiveUsers() {
   });
 }
 
+function renderBoardAuditMeta() {
+  if (!state.lastImportedAt) {
+    elements.boardAuditMeta.textContent = "";
+    elements.boardAuditMeta.classList.add("hidden");
+    return;
+  }
+
+  elements.boardAuditMeta.textContent = `Last imported ${formatRelativeDate(state.lastImportedAt)}${state.lastImportedBy ? ` by ${state.lastImportedBy}` : ""}`;
+  elements.boardAuditMeta.title = formatAbsoluteDate(state.lastImportedAt);
+  elements.boardAuditMeta.classList.remove("hidden");
+}
+
 function buildExportPayload() {
   return {
     format: "password-board-v1",
@@ -326,6 +366,8 @@ function buildExportPayload() {
     exportedBy: state.actorName,
     boardName: state.boardName,
     generatorSettings: state.generatorSettings,
+    lastImportedAt: state.lastImportedAt,
+    lastImportedBy: state.lastImportedBy,
     items: state.items.map((item) => ({
       sortOrder: item.sortOrder,
       name: item.name,
@@ -333,8 +375,10 @@ function buildExportPayload() {
       username: item.username,
       password: item.password,
       createdAt: item.createdAt,
+      createdBy: item.createdBy,
       updatedAt: item.updatedAt,
       updatedBy: item.updatedBy,
+      passwordRotationCount: item.passwordRotationCount,
       history: item.history.map((entry) => ({
         password: entry.password,
         createdAt: entry.createdAt,
@@ -399,11 +443,14 @@ async function bootstrapRoom(roomKey) {
   state.activeUsers = payload.activeUsers || [];
   state.boardName = payload.boardName || "Untitled Board";
   state.generatorSettings = normalizeGeneratorSettings(payload.generatorSettings);
+  state.lastImportedAt = payload.lastImportedAt || "";
+  state.lastImportedBy = payload.lastImportedBy || "";
   state.lastSyncedAt = new Date().toISOString();
   elements.boardNameInput.value = state.boardName;
   document.title = `${state.boardName} | PassBoard`;
   applyGeneratorSettingsToForm();
   renderActiveUsers();
+  renderBoardAuditMeta();
   renderItems();
 }
 
@@ -437,13 +484,22 @@ function connectSocket(roomKey, actorName) {
     state.activeUsers = payload.activeUsers || [];
     state.boardName = payload.boardName || "Untitled Board";
     state.generatorSettings = normalizeGeneratorSettings(payload.generatorSettings);
+    state.lastImportedAt = payload.lastImportedAt || "";
+    state.lastImportedBy = payload.lastImportedBy || "";
     state.lastSyncedAt = new Date().toISOString();
     elements.boardNameInput.value = state.boardName;
     document.title = `${state.boardName} | PassBoard`;
     applyGeneratorSettingsToForm();
     renderActiveUsers();
+    renderBoardAuditMeta();
     renderItems();
     setConnectionStatus("live", `Last updated ${formatRelativeDate(state.lastSyncedAt)}`);
+  });
+
+  socket.on("room:destroyed", (payload) => {
+    const destroyedBy = payload?.destroyedBy ? ` by ${payload.destroyedBy}` : "";
+    alert(`This board was destroyed${destroyedBy}.`);
+    window.location.assign("/");
   });
 
   state.socket = socket;
@@ -582,6 +638,7 @@ function renderItems() {
     const passwordInput = fragment.querySelector('[data-field="password"]');
     const historyList = fragment.querySelector("[data-history]");
     const updatedLabel = fragment.querySelector('[data-meta="updated-at"]');
+    const auditLabel = fragment.querySelector('[data-meta="audit"]');
     const historyMenu = fragment.querySelector(".history-menu");
     row.dataset.itemId = item.id;
 
@@ -597,7 +654,8 @@ function renderItems() {
       historyList.innerHTML = '<div class="history-entry">No previous passwords yet.</div>';
     } else {
       historyList.innerHTML = "";
-      item.history.forEach((entry) => {
+      const visibleCount = state.historyVisibleCounts[item.id] || HISTORY_PREVIEW_LIMIT;
+      item.history.slice(0, visibleCount).forEach((entry) => {
         const wrapper = document.createElement("div");
         wrapper.className = "history-entry";
         wrapper.title = formatAbsoluteDate(entry.createdAt);
@@ -618,7 +676,27 @@ function renderItems() {
         wrapper.append(date, value, copyButton);
         historyList.appendChild(wrapper);
       });
+
+      if (item.history.length > visibleCount) {
+        const showMoreButton = document.createElement("button");
+        showMoreButton.className = "secondary history-more-button";
+        const remaining = item.history.length - visibleCount;
+        const increment = Math.min(HISTORY_PREVIEW_LIMIT, remaining);
+        showMoreButton.textContent = `Show ${increment} older`;
+        showMoreButton.addEventListener("click", (event) => {
+          event.preventDefault();
+          state.historyVisibleCounts[item.id] = visibleCount + HISTORY_PREVIEW_LIMIT;
+          renderItems();
+          const refreshedMenu = elements.itemsContainer.querySelector(`[data-item-id="${item.id}"] .history-menu`);
+          if (refreshedMenu) {
+            refreshedMenu.open = true;
+          }
+        });
+        historyList.appendChild(showMoreButton);
+      }
     }
+
+    auditLabel.textContent = `Created by ${item.createdBy || "unknown"} · ${item.passwordRotationCount || 0} rotation${item.passwordRotationCount === 1 ? "" : "s"}`;
 
     [nameInput, portInput, usernameInput].forEach((input) => {
       input.addEventListener("change", async () => {
@@ -753,6 +831,19 @@ elements.leaveRoomButton.addEventListener("click", () => {
   window.location.assign("/");
 });
 
+elements.destroyRoomButton.addEventListener("click", async () => {
+  const confirmed = window.confirm("Destroy this room and permanently delete all stored passwords?");
+  if (!confirmed) {
+    return;
+  }
+
+  try {
+    await emit("room:destroy", {});
+  } catch (error) {
+    alert(error.message || "Unable to destroy the room.");
+  }
+});
+
 elements.joinRoomForm.addEventListener("submit", (event) => {
   event.preventDefault();
   const roomKey = extractRoomKey(elements.roomKeyInput.value);
@@ -783,8 +874,13 @@ elements.togglePasswordVisibility.addEventListener("click", () => {
 });
 
 elements.exportBoardButton.addEventListener("click", () => {
+  const confirmed = window.confirm("Exports contain plaintext passwords. Continue?");
+  if (!confirmed) {
+    return;
+  }
+
   const slug = state.boardName.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "board";
-  downloadJson(`${slug}.json`, buildExportPayload());
+  downloadJson(`${slug}-${formatFilenameTimestamp()}.json`, buildExportPayload());
 });
 
 elements.importBoardButton.addEventListener("click", () => {
@@ -894,6 +990,5 @@ async function initialize() {
 }
 
 initialize().catch((error) => {
-  console.error(error);
   alert(error.message || "Something went wrong while opening the room.");
 });

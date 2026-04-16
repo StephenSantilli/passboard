@@ -180,7 +180,9 @@ h1 {
 .hero-copy,
 #item-count,
 [data-meta="updated-at"],
-.signed-in-as {
+.signed-in-as,
+.board-audit-meta,
+.item-audit-meta {
   color: var(--muted);
 }
 
@@ -247,6 +249,11 @@ h1 {
 
 .signed-in-as {
   margin-bottom: 1rem;
+}
+
+.board-audit-meta {
+  margin: -0.45rem 0 1rem;
+  line-height: 1.5;
 }
 
 .active-users-block {
@@ -609,6 +616,18 @@ summary {
   margin: 0.25rem 0 0.7rem;
   font-family: "SFMono-Regular", Menlo, Monaco, Consolas, monospace;
   word-break: break-all;
+}
+
+.history-more-button {
+  width: 100%;
+  margin-top: 0.6rem;
+}
+
+.item-audit-meta {
+  display: block;
+  margin-top: 0.2rem;
+  font-size: 0.88rem;
+  line-height: 1.45;
 }
 
 .hidden {

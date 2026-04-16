@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>PassBoard</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <nav id="room-navbar" class="room-navbar hidden" aria-label="Room navigation">
+        <div class="nav-left">
+          <a href="/" class="textmark" aria-label="PassBoard home">PassBoard</a>
+          <button id="home-button" class="ghost">Home</button>
+          <button id="leave-room-button" class="ghost">Leave Room</button>
+        </div>
+        <div class="nav-right">
+          <a
+            href="https://github.com/StephenSantilli/passboard"
+            class="icon-link"
+            aria-label="PassBoard GitHub repository"
+            target="_blank"
+            rel="noreferrer"
+          >
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path
+                d="M12 2C6.477 2 2 6.589 2 12.25c0 4.528 2.865 8.37 6.839 9.726c.5.095.682-.221.682-.492c0-.243-.009-.888-.014-1.743c-2.782.617-3.369-1.37-3.369-1.37c-.455-1.176-1.11-1.49-1.11-1.49c-.908-.636.069-.623.069-.623c1.004.072 1.532 1.056 1.532 1.056c.892 1.564 2.341 1.112 2.91.85c.091-.665.35-1.112.636-1.368c-2.221-.259-4.555-1.137-4.555-5.061c0-1.118.39-2.032 1.029-2.748c-.103-.26-.446-1.304.098-2.719c0 0 .84-.275 2.75 1.05A9.325 9.325 0 0 1 12 6.88a9.29 9.29 0 0 1 2.504.348c1.909-1.325 2.748-1.05 2.748-1.05c.546 1.415.202 2.459.1 2.719c.64.716 1.027 1.63 1.027 2.748c0 3.934-2.337 4.799-4.566 5.053c.359.318.678.944.678 1.902c0 1.374-.012 2.482-.012 2.82c0 .273.18.591.688.49C19.138 20.616 22 16.776 22 12.25C22 6.589 17.523 2 12 2Z"
+                fill="currentColor"
+              />
+            </svg>
+          </a>
+          <button id="export-board-button" class="ghost">Export JSON</button>
+          <button id="import-board-button" class="ghost">Import JSON</button>
+          <input id="import-board-input" type="file" accept="application/json" hidden />
+        </div>
+      </nav>
+
+      <header class="hero">
+        <div>
+          <p class="eyebrow">PassBoard</p>
+          <h1>Shared secrets for fast-moving competition teams.</h1>
+          <p class="hero-copy">
+            Join with a room UUID, edit collaboratively in real time, and keep
+            every previous password attached to the service that used it.
+          </p>
+        </div>
+        <div class="hero-actions" id="landing-actions">
+          <button id="create-room-button" class="primary">Create New Room</button>
+          <form id="join-room-form" class="join-form">
+            <label for="room-key-input">Join Existing Room</label>
+            <input
+              id="room-key-input"
+              name="roomKey"
+              type="text"
+              autocomplete="off"
+              placeholder="Paste room UUID"
+              spellcheck="false"
+            />
+            <button type="submit" class="secondary">Open Room</button>
+          </form>
+        </div>
+      </header>
+
+      <main id="board-view" class="board-view hidden">
+        <section class="room-banner">
+          <div>
+            <p class="eyebrow">Current Board</p>
+            <input
+              id="board-name-input"
+              class="board-name-input"
+              type="text"
+              placeholder="Untitled Board"
+              maxlength="80"
+            />
+            <p class="signed-in-as">Signed in as <strong id="signed-in-name"></strong></p>
+            <div class="active-users-block">
+              <p class="eyebrow">Active Users</p>
+              <div id="active-users-list" class="active-users-list"></div>
+            </div>
+            <div class="room-link-row">
+              <input id="room-link" class="room-link" readonly />
+              <button id="copy-room-link" class="secondary">Copy Link</button>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel board-panel">
+          <div class="panel-header">
+            <div class="board-heading">
+              <h2>Board</h2>
+              <div class="status-pill compact" id="board-live-indicator">
+                <strong id="connection-label">Connecting…</strong>
+                <span id="connection-detail">Waiting for first sync</span>
+              </div>
+            </div>
+            <div class="board-tools">
+              <button id="open-generator-settings" class="ghost">
+                Generator Settings
+              </button>
+              <button id="toggle-password-visibility" class="ghost">Hide Passwords</button>
+              <p id="item-count">0 items</p>
+            </div>
+          </div>
+          <div class="board-columns" aria-hidden="true">
+            <span></span>
+            <span>Name</span>
+            <span>Port</span>
+            <span>Username</span>
+            <span>Password</span>
+            <span>Updated</span>
+            <span></span>
+          </div>
+          <div id="items-container" class="items-container"></div>
+          <form id="create-item-form" class="board-row add-row">
+            <div class="drag-cell add-cell-label">New</div>
+            <input name="name" type="text" placeholder="Name" required />
+            <input name="port" type="text" placeholder="Port" />
+            <div class="field-with-actions">
+              <input name="username" id="new-item-username" type="text" placeholder="Username" />
+              <button type="button" id="copy-new-item-username" class="icon-button" aria-label="Copy username">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M9 4h6l1 2h2a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h2l1-2z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
+                  <path d="M9 8h6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" />
+                </svg>
+              </button>
+            </div>
+            <div class="password-stack inline-password-stack">
+              <div class="password-row">
+                <div class="field-with-actions">
+                  <input
+                    name="password"
+                    id="new-item-password"
+                    type="text"
+                    placeholder="Password"
+                    required
+                    spellcheck="false"
+                  />
+                  <button type="button" id="copy-new-item-password" class="icon-button" aria-label="Copy password">
+                    <svg viewBox="0 0 24 24" aria-hidden="true">
+                      <path d="M9 4h6l1 2h2a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h2l1-2z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
+                      <path d="M9 8h6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" />
+                    </svg>
+                  </button>
+                </div>
+                <button type="button" id="generate-new-item-password" class="icon-button standalone" aria-label="Generate password">
+                  <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="M20 6v5h-5M4 18v-5h5M6.7 9A7 7 0 0 1 18 7l2 4M18 15a7 7 0 0 1-11.3 2L4 13" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
+                  </svg>
+                </button>
+              </div>
+            </div>
+            <span></span>
+            <button type="submit" class="primary">Add</button>
+          </form>
+        </section>
+      </main>
+    </div>
+
+    <dialog id="generator-dialog">
+      <form method="dialog" class="dialog-card" id="generator-form">
+        <div class="panel-header">
+          <h2>Password Generator</h2>
+          <button class="ghost">Close</button>
+        </div>
+        <label>
+          <span id="generator-slider-label">Length</span>
+          <output id="generator-slider-value" for="generator-size">20</output>
+          <input type="range" id="generator-size" name="size" min="8" max="64" step="1" />
+        </label>
+        <fieldset class="mode-group">
+          <legend>Mode</legend>
+          <div class="mode-tabs">
+            <label class="mode-tab">
+              <input type="radio" name="mode" value="random" />
+              <span>Random Characters</span>
+            </label>
+            <label class="mode-tab">
+              <input type="radio" name="mode" value="words" />
+              <span>Short Words</span>
+            </label>
+          </div>
+        </fieldset>
+        <label class="generator-word-option">
+          Word separator
+          <input type="text" name="separator" maxlength="3" placeholder="-" />
+        </label>
+        <div class="generator-options-grid generator-random-option">
+          <label class="checkbox">
+            <input type="checkbox" name="uppercase" />
+            Include uppercase
+          </label>
+          <label class="checkbox">
+            <input type="checkbox" name="lowercase" />
+            Include lowercase
+          </label>
+          <label class="checkbox">
+            <input type="checkbox" name="numbers" />
+            Include numbers
+          </label>
+          <label class="checkbox">
+            <input type="checkbox" name="symbols" />
+            Include symbols
+          </label>
+          <label class="checkbox">
+            <input type="checkbox" name="excludeSimilar" />
+            Exclude similar characters
+          </label>
+        </div>
+        <div class="actions-row">
+          <button value="cancel" class="secondary">Cancel</button>
+          <button id="save-generator-settings" value="default" class="primary">
+            Save Settings
+          </button>
+        </div>
+      </form>
+    </dialog>
+
+    <template id="item-template">
+      <article class="board-row item-card" draggable="true">
+        <div class="drag-cell" data-drag-handle title="Drag to reorder">⋮⋮</div>
+        <div>
+          <input data-field="name" type="text" placeholder="Name" />
+        </div>
+        <div>
+          <input data-field="port" type="text" placeholder="Port" />
+        </div>
+        <div>
+          <div class="field-with-actions">
+            <input data-field="username" type="text" placeholder="Username" />
+            <button data-action="copy-username" class="icon-button" aria-label="Copy username">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M9 4h6l1 2h2a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h2l1-2z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
+                <path d="M9 8h6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" />
+              </svg>
+            </button>
+          </div>
+        </div>
+        <div class="password-stack inline-password-stack">
+          <div class="password-row">
+            <div class="field-with-actions">
+              <input
+                data-field="password"
+                class="password-input"
+                type="text"
+                spellcheck="false"
+              />
+              <button data-action="copy-password" class="icon-button" aria-label="Copy password">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M9 4h6l1 2h2a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h2l1-2z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
+                  <path d="M9 8h6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" />
+                </svg>
+              </button>
+            </div>
+            <button data-action="generate-password" class="icon-button standalone" aria-label="Generate password">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M20 6v5h-5M4 18v-5h5M6.7 9A7 7 0 0 1 18 7l2 4M18 15a7 7 0 0 1-11.3 2L4 13" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
+              </svg>
+            </button>
+            <details class="history-menu">
+              <summary aria-label="Password history">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path
+                    d="M12 8v5l3 2m6-3a9 9 0 1 1-2.64-6.36"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="1.8"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                  />
+                </svg>
+              </summary>
+              <div class="history-list" data-history></div>
+            </details>
+          </div>
+        </div>
+        <div class="card-footer">
+          <span data-meta="updated-at"></span>
+        </div>
+        <div class="row-actions">
+          <button data-action="delete-item" class="danger">Delete</button>
+        </div>
+      </article>
+    </template>
+
+    <dialog id="name-dialog">
+      <form method="dialog" class="dialog-card" id="name-form">
+        <div class="panel-header">
+          <h2>Join Board</h2>
+        </div>
+        <label>
+          Your name
+          <input
+            id="display-name-input"
+            name="displayName"
+            type="text"
+            maxlength="40"
+            autocomplete="name"
+            placeholder="Stephen"
+            required
+          />
+        </label>
+        <div class="actions-row">
+          <button id="save-display-name" value="default" class="primary">
+            Continue
+          </button>
+        </div>
+      </form>
+    </dialog>
+
+    <script src="/socket.io/socket.io.js"></script>
+    <script src="/app.js" defer></script>
+  </body>
+</html>

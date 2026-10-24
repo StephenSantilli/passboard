@@ -10,6 +10,8 @@ const DEFAULT_GENERATOR_SETTINGS = {
   excludeSimilar: true
 };
 
+// A mismatched server can reject partial edits or use unsafe whole-row writes.
+const EXPECTED_SERVER_PROTOCOL = "field-updates-v1";
 const HISTORY_PREVIEW_LIMIT = 25;
 const ACTIVE_ROOM_STORAGE_KEY = "passboard-active-room";
 
@@ -18,6 +20,7 @@ const state = {
   actorName: "",
   socket: null,
   boardName: "Untitled Board",
+  expiresAt: "",
   generatorSettings: normalizeGeneratorSettings(),
   wordList: [],
   items: [],
@@ -25,7 +28,8 @@ const state = {
   lastImportedAt: "",
   lastImportedBy: "",
   passwordsHidden: false,
-  lastSyncedAt: null,
+  lastChangedAt: null,
+  boardRevision: 0,
   connectionState: "connecting",
   draggedItemId: null,
   historyVisibleCounts: {}
@@ -51,6 +55,7 @@ const elements = {
   importBoardButton: document.getElementById("import-board-button"),
   importBoardInput: document.getElementById("import-board-input"),
   boardNameInput: document.getElementById("board-name-input"),
+  roomExpiration: document.getElementById("room-expiration"),
   boardAuditMeta: document.getElementById("board-audit-meta"),
   signedInName: document.getElementById("signed-in-name"),
   activeUsersList: document.getElementById("active-users-list"),
@@ -318,11 +323,44 @@ function formatFilenameTimestamp(value = new Date()) {
   return `${parts.join("")}-${time.join("")}`;
 }
 
+function updateRoomCountdown() {
+  if (!state.expiresAt) {
+    elements.roomExpiration.textContent = "Unavailable";
+    return;
+  }
+
+  const expiresAt = new Date(state.expiresAt);
+  const remaining = expiresAt.getTime() - Date.now();
+  if (!Number.isFinite(remaining)) {
+    elements.roomExpiration.textContent = "Unavailable";
+    return;
+  }
+
+  elements.roomExpiration.dataset.tooltip = expiresAt.toLocaleString(undefined, {
+    dateStyle: "full",
+    timeStyle: "long"
+  });
+  elements.roomExpiration.setAttribute("aria-label", `Room expires ${elements.roomExpiration.dataset.tooltip}`);
+
+  if (remaining <= 0) {
+    elements.roomExpiration.textContent = "Expired";
+  } else if (remaining >= 24 * 60 * 60 * 1000) {
+    const days = Math.ceil(remaining / (24 * 60 * 60 * 1000));
+    elements.roomExpiration.textContent = `${days} day${days === 1 ? "" : "s"}`;
+  } else {
+    const minutesRemaining = Math.ceil(remaining / (60 * 1000));
+    const hours = Math.floor(minutesRemaining / 60);
+    const minutes = minutesRemaining % 60;
+    elements.roomExpiration.textContent = `${hours}h ${minutes}m`;
+  }
+}
+
 function updateRelativeTimestamps() {
+  updateRoomCountdown();
   document.querySelectorAll("[data-timestamp-value]").forEach((node) => {
     const timestamp = node.dataset.timestampValue;
     const actor = node.dataset.timestampActor;
-    node.textContent = `Updated ${formatRelativeDate(timestamp)}${actor ? ` by ${actor}` : ""}`;
+    node.textContent = `Changed ${formatRelativeDate(timestamp)}${actor ? ` by ${actor}` : ""}`;
     node.title = formatAbsoluteDate(timestamp);
   });
 
@@ -331,27 +369,34 @@ function updateRelativeTimestamps() {
     elements.boardAuditMeta.title = formatAbsoluteDate(state.lastImportedAt);
   }
 
-  if (state.connectionState === "live" && state.lastSyncedAt) {
-    elements.connectionDetail.textContent = `Last updated ${formatRelativeDate(state.lastSyncedAt)}`;
-    elements.connectionDetail.title = formatAbsoluteDate(state.lastSyncedAt);
+  updateLastChangeDetail();
+}
+
+function updateLastChangeDetail() {
+  // The detail describes content changes, never incoming sync/presence events.
+  elements.connectionDetail.textContent = state.lastChangedAt
+    ? `Changed ${formatRelativeDate(state.lastChangedAt)}`
+    : "No changes yet";
+  if (state.lastChangedAt) {
+    elements.connectionDetail.title = formatAbsoluteDate(state.lastChangedAt);
+  } else {
+    elements.connectionDetail.removeAttribute("title");
   }
 }
 
-function setConnectionStatus(variant, detail) {
+function setConnectionStatus(variant, reason = "") {
+  // Only Socket.IO connection events determine whether the badge says Live.
   state.connectionState = variant;
   elements.connectionStatus.classList.remove("live", "offline", "connecting");
   elements.connectionStatus.classList.add(variant);
-
-  if (variant === "live") {
-    elements.connectionLabel.textContent = "Live";
-    elements.connectionDetail.textContent = detail || "Live sync active";
-  } else if (variant === "offline") {
-    elements.connectionLabel.textContent = "Disconnected";
-    elements.connectionDetail.textContent = detail || "Trying to reconnect";
+  elements.connectionLabel.textContent = variant === "live"
+    ? "Live" : variant === "offline" ? "Disconnected" : "Connecting";
+  if (reason && variant !== "live") {
+    elements.connectionStatus.title = reason;
   } else {
-    elements.connectionLabel.textContent = "Connecting";
-    elements.connectionDetail.textContent = detail || "Waiting for first sync";
+    elements.connectionStatus.removeAttribute("title");
   }
+  updateLastChangeDetail();
 }
 
 function updatePasswordVisibilityUi() {
@@ -429,6 +474,8 @@ function buildExportPayload() {
       updatedAt: item.updatedAt,
       updatedBy: item.updatedBy,
       passwordRotationCount: item.passwordRotationCount,
+      passwordCreatedAt: item.passwordCreatedAt,
+      passwordCreatedBy: item.passwordCreatedBy,
       history: item.history.map((entry) => ({
         password: entry.password,
         createdAt: entry.createdAt,
@@ -450,17 +497,23 @@ function downloadJson(filename, payload) {
   URL.revokeObjectURL(url);
 }
 
-async function importBoardFromFile(file) {
+async function importBoardFromFile(file, expectedRevision) {
   const text = await file.text();
   const payload = JSON.parse(text);
   if (!payload || !Array.isArray(payload.items)) {
     throw new Error("Import file must contain a board object with an items array.");
   }
+  if (payload.items.length === 0) throw new Error("The import file contains no items.");
+
+  const confirmed = window.confirm(
+    `Append ${payload.items.length} items to the existing ${state.items.length} entries? ` +
+    `Existing passwords and history will NOT be deleted or overwritten. Duplicate entries may be added. Continue?`
+  );
+  if (!confirmed) return;
 
   await emit("room:import", {
-    boardName: payload.boardName,
-    generatorSettings: payload.generatorSettings,
-    items: payload.items
+    items: payload.items,
+    expectedRevision
   });
 }
 
@@ -483,6 +536,12 @@ async function createRoom() {
   window.location.assign(payload.url);
 }
 
+function requireCompatibleServer(payload) {
+  if (payload?.clientProtocolVersion !== EXPECTED_SERVER_PROTOCOL) {
+    throw new Error("PassBoard server/browser version mismatch. Deploy the matching server.js, restart the server, then refresh this page. Your edits have not been sent.");
+  }
+}
+
 async function bootstrapRoom(roomKey) {
   const response = await fetch(`/api/rooms/${roomKey}/bootstrap`);
   if (!response.ok) {
@@ -502,16 +561,21 @@ async function bootstrapRoom(roomKey) {
   }
 
   const payload = await response.json();
+  requireCompatibleServer(payload);
   state.items = payload.items;
   state.activeUsers = payload.activeUsers || [];
   state.boardName = payload.boardName || "Untitled Board";
+  state.expiresAt = payload.expiresAt || "";
   state.generatorSettings = normalizeGeneratorSettings(payload.generatorSettings);
   state.lastImportedAt = payload.lastImportedAt || "";
   state.lastImportedBy = payload.lastImportedBy || "";
-  state.lastSyncedAt = new Date().toISOString();
-  elements.boardNameInput.value = state.boardName;
+  state.lastChangedAt = payload.boardUpdatedAt || null;
+  state.boardRevision = payload.boardRevision;
+  if (document.activeElement !== elements.boardNameInput && !boardNameSavePending) {
+    elements.boardNameInput.value = state.boardName;
+  }
   document.title = `${state.boardName} | PassBoard`;
-  applyGeneratorSettingsToForm();
+  if (!elements.generatorDialog.open) applyGeneratorSettingsToForm();
   renderActiveUsers();
   renderBoardAuditMeta();
   renderItems();
@@ -530,7 +594,7 @@ function connectSocket(roomKey, actorName) {
   });
 
   socket.on("connect", () => {
-    setConnectionStatus("live", state.lastSyncedAt ? `Last updated ${formatRelativeDate(state.lastSyncedAt)}` : "Live sync active");
+    setConnectionStatus("live");
   });
 
   socket.on("disconnect", (reason) => {
@@ -543,20 +607,32 @@ function connectSocket(roomKey, actorName) {
   });
 
   socket.on("room:state", (payload) => {
+    try {
+      requireCompatibleServer(payload);
+    } catch (error) {
+      socket.disconnect();
+      setConnectionStatus("offline", "Server/browser version mismatch");
+      alert(error.message);
+      return;
+    }
     state.items = payload.items;
     state.activeUsers = payload.activeUsers || [];
     state.boardName = payload.boardName || "Untitled Board";
+    state.expiresAt = payload.expiresAt || "";
     state.generatorSettings = normalizeGeneratorSettings(payload.generatorSettings);
     state.lastImportedAt = payload.lastImportedAt || "";
     state.lastImportedBy = payload.lastImportedBy || "";
-    state.lastSyncedAt = new Date().toISOString();
-    elements.boardNameInput.value = state.boardName;
+    state.lastChangedAt = payload.boardUpdatedAt || null;
+    state.boardRevision = payload.boardRevision;
+    if (document.activeElement !== elements.boardNameInput && !boardNameSavePending) {
+      elements.boardNameInput.value = state.boardName;
+    }
     document.title = `${state.boardName} | PassBoard`;
-    applyGeneratorSettingsToForm();
+    if (!elements.generatorDialog.open) applyGeneratorSettingsToForm();
     renderActiveUsers();
     renderBoardAuditMeta();
     renderItems();
-    setConnectionStatus("live", `Last updated ${formatRelativeDate(state.lastSyncedAt)}`);
+    setConnectionStatus("live");
   });
 
   socket.on("room:destroyed", (payload) => {
@@ -578,19 +654,33 @@ function connectSocket(roomKey, actorName) {
 
 function emit(eventName, payload) {
   return new Promise((resolve, reject) => {
-    if (!state.socket) {
-      reject(new Error("Not connected."));
+    if (!state.socket?.connected) {
+      reject(new Error("Disconnected. Nothing was sent or queued; reconnect before trying again."));
       return;
     }
 
-    state.socket.emit(eventName, payload, (response) => {
-      if (response?.ok) {
-        resolve(response);
-        return;
+    // A lost acknowledgment must not freeze row repainting indefinitely.
+    let finished = false;
+    const timeoutId = window.setTimeout(() => {
+      if (finished) return;
+      finished = true;
+      reject(new Error("Save confirmation timed out. Check the board before retrying; the change may have reached the server."));
+    }, 20000);
+    try {
+      state.socket.emit(eventName, payload, (response) => {
+        if (finished) return;
+        finished = true;
+        window.clearTimeout(timeoutId);
+        if (response?.ok) resolve(response);
+        else reject(new Error(response?.error || "Request failed."));
+      });
+    } catch (error) {
+      if (!finished) {
+        finished = true;
+        window.clearTimeout(timeoutId);
+        reject(error);
       }
-
-      reject(new Error(response?.error || "Request failed."));
-    });
+    }
   });
 }
 
@@ -712,8 +802,56 @@ function setFreshGeneratedPassword(targetInput) {
   targetInput.value = generatePassword();
 }
 
+// Replace native long-delay button tooltips with consistent 250ms hover hints.
+function applyButtonTooltips(root = document) {
+  const targets = [
+    '[data-action="copy-username"]',
+    '[data-action="copy-password"]',
+    '[data-action="show-password-large"]',
+    '[data-action="generate-password"]',
+    '.history-menu summary',
+    '.history-entry button',
+    '#copy-room-link', '#view-room-link',
+    '#copy-new-item-username', '#copy-new-item-password',
+    '#view-new-item-password', '#generate-new-item-password',
+    '#copy-large-password', '#copy-large-room-link'
+  ].join(", ");
+  root.querySelectorAll(targets).forEach((element) => {
+    const label = element.getAttribute("title");
+    if (label) {
+      element.dataset.tooltip = label;
+      element.removeAttribute("title");
+    }
+    if (element.dataset.tooltip) element.classList.add("quick-tooltip");
+  });
+}
+
+// Preserve in-progress edits across socket broadcasts (including presence changes).
+// Server state is still updated immediately; only repainting the form is deferred.
+let pendingItemSaves = 0;
+let deferredItemRender = false;
+let boardNameSavePending = false;
+
+function isItemInputFocused() {
+  const focused = document.activeElement;
+  return Boolean(focused && elements.itemsContainer.contains(focused) && focused.matches("input[data-field]"));
+}
+
+function flushDeferredItems() {
+  if (deferredItemRender && pendingItemSaves === 0 && !isItemInputFocused()) renderItems();
+}
+
+elements.itemsContainer.addEventListener("focusout", () => {
+  queueMicrotask(flushDeferredItems);
+});
+
 function renderItems() {
   elements.itemCount.textContent = `${state.items.length} item${state.items.length === 1 ? "" : "s"}`;
+  if (isItemInputFocused() || pendingItemSaves > 0) {
+    deferredItemRender = true;
+    return;
+  }
+  deferredItemRender = false;
   elements.itemsContainer.innerHTML = "";
 
   state.items.forEach((item) => {
@@ -738,82 +876,121 @@ function renderItems() {
     updatedLabel.dataset.timestampValue = item.updatedAt;
     updatedLabel.dataset.timestampActor = item.updatedBy || "";
 
-    if (!item.history.length) {
-      historyList.innerHTML = '<div class="history-entry">No previous passwords yet.</div>';
-    } else {
-      historyList.innerHTML = "";
-      const visibleCount = state.historyVisibleCounts[item.id] || HISTORY_PREVIEW_LIMIT;
-      item.history.slice(0, visibleCount).forEach((entry) => {
-        const wrapper = document.createElement("div");
-        wrapper.className = "history-entry";
-        wrapper.title = formatAbsoluteDate(entry.createdAt);
+    historyList.innerHTML = "";
+    const visibleCount = state.historyVisibleCounts[item.id] || HISTORY_PREVIEW_LIMIT;
+    // Sort historical entries newest-first regardless of backend or import order.
+    // The current password always appears above prior versions.
+    const historyEntries = [
+      {
+        password: item.password,
+        createdAt: item.passwordCreatedAt || item.createdAt,
+        createdBy: item.passwordCreatedBy || item.createdBy,
+        current: true
+      },
+      ...[...item.history]
+        .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))
+        .slice(0, visibleCount)
+    ];
+    historyEntries.forEach((entry) => {
+      const wrapper = document.createElement("div");
+      wrapper.className = entry.current ? "history-entry current" : "history-entry";
+      wrapper.title = formatAbsoluteDate(entry.createdAt);
 
-        const date = document.createElement("strong");
-        date.textContent = `${formatRelativeDate(entry.createdAt)}${entry.createdBy ? ` by ${entry.createdBy}` : ""}`;
+      const date = document.createElement("strong");
+      date.textContent = `${entry.current ? "Current · " : ""}${formatRelativeDate(entry.createdAt)}${entry.createdBy ? ` by ${entry.createdBy}` : ""}`;
 
-        const value = document.createElement("span");
-        value.textContent = state.passwordsHidden ? "••••••••" : entry.password;
+      const value = document.createElement("span");
+      value.textContent = state.passwordsHidden ? "••••••••" : entry.password;
 
-        const copyButton = document.createElement("button");
-        copyButton.className = "secondary";
-        copyButton.textContent = "Copy";
-        copyButton.title = "Copy password";
-        copyButton.addEventListener("click", async () => {
-          await navigator.clipboard.writeText(entry.password);
-        });
-
-        wrapper.append(date, value, copyButton);
-        historyList.appendChild(wrapper);
+      const copyButton = document.createElement("button");
+      copyButton.className = "secondary";
+      copyButton.textContent = "Copy";
+      copyButton.title = "Copy password";
+      copyButton.addEventListener("click", async () => {
+        await navigator.clipboard.writeText(entry.password);
       });
 
-      if (item.history.length > visibleCount) {
-        const showMoreButton = document.createElement("button");
-        showMoreButton.className = "secondary history-more-button";
-        showMoreButton.title = "Show older password history";
-        const remaining = item.history.length - visibleCount;
-        const increment = Math.min(HISTORY_PREVIEW_LIMIT, remaining);
-        showMoreButton.textContent = `Show ${increment} older`;
-        showMoreButton.addEventListener("click", (event) => {
-          event.preventDefault();
-          state.historyVisibleCounts[item.id] = visibleCount + HISTORY_PREVIEW_LIMIT;
-          renderItems();
-          const refreshedMenu = elements.itemsContainer.querySelector(`[data-item-id="${item.id}"] .history-menu`);
-          if (refreshedMenu) {
-            refreshedMenu.open = true;
-          }
-        });
-        historyList.appendChild(showMoreButton);
-      }
+      wrapper.append(date, value, copyButton);
+      historyList.appendChild(wrapper);
+    });
+
+    if (!item.history.length) {
+      const emptyHistory = document.createElement("div");
+      emptyHistory.className = "history-empty";
+      emptyHistory.textContent = "No previous passwords yet.";
+      historyList.appendChild(emptyHistory);
+    } else if (item.history.length > visibleCount) {
+      const showMoreButton = document.createElement("button");
+      showMoreButton.className = "secondary history-more-button";
+      showMoreButton.title = "Show older password history";
+      const remaining = item.history.length - visibleCount;
+      const increment = Math.min(HISTORY_PREVIEW_LIMIT, remaining);
+      showMoreButton.textContent = `Show ${increment} older`;
+      showMoreButton.addEventListener("click", (event) => {
+        event.preventDefault();
+        state.historyVisibleCounts[item.id] = visibleCount + HISTORY_PREVIEW_LIMIT;
+        renderItems();
+        const refreshedMenu = elements.itemsContainer.querySelector(`[data-item-id="${item.id}"] .history-menu`);
+        if (refreshedMenu) refreshedMenu.open = true;
+      });
+      historyList.appendChild(showMoreButton);
     }
+
+    historyMenu.querySelector("summary").addEventListener("click", () => {
+      // Only one password history popover may be open at a time.
+      document.querySelectorAll(".history-menu[open]").forEach((other) => {
+        if (other !== historyMenu) other.open = false;
+      });
+    });
 
     auditLabel.textContent = `Created by ${item.createdBy || "unknown"} · ${item.passwordRotationCount || 0} rotation${item.passwordRotationCount === 1 ? "" : "s"}`;
 
     [nameInput, ipInput, usernameInput].forEach((input) => {
       input.addEventListener("change", async () => {
-        await emit("item:updateMeta", {
-          id: item.id,
-          name: nameInput.value,
-          ip: ipInput.value,
-          username: usernameInput.value
-        });
+        const field = input.dataset.field;
+        const expectedValue = String(item[field] ?? "");
+        if (input.value === expectedValue) return;
+        pendingItemSaves++;
+        let saved = false;
+        try {
+          await emit("item:updateMeta", {
+            id: item.id, field, value: input.value, expectedValue
+          });
+          saved = true;
+        } catch (error) {
+          alert(`${error.message} Your typed value is still visible; copy it before refreshing.`);
+          input.focus();
+        } finally {
+          pendingItemSaves--;
+          if (saved) renderItems();
+          else flushDeferredItems();
+        }
       });
     });
 
     const commitPasswordEdit = async () => {
       const nextPassword = passwordInput.value;
-      if (nextPassword === item.password) {
-        return;
+      if (nextPassword === item.password) return;
+      pendingItemSaves++;
+      let saved = false;
+      try {
+        await emit("item:updatePassword", {
+          id: item.id,
+          password: nextPassword,
+          expectedPassword: item.password
+        });
+        saved = true;
+      } catch (error) {
+        alert(`${error.message} Your typed password is still visible; copy it before refreshing.`);
+        passwordInput.focus();
+      } finally {
+        pendingItemSaves--;
+        if (saved) renderItems();
+        else flushDeferredItems();
       }
-
-      await emit("item:updatePassword", {
-        id: item.id,
-        password: nextPassword
-      });
     };
 
-    passwordInput.addEventListener("blur", async () => {
-      await commitPasswordEdit();
-    });
+    passwordInput.addEventListener("blur", commitPasswordEdit);
 
     passwordInput.addEventListener("keydown", async (event) => {
       if (event.key === "Enter") {
@@ -842,11 +1019,16 @@ function renderItems() {
     fragment
       .querySelector('[data-action="generate-password"]')
       .addEventListener("click", async () => {
-        await emit("item:updatePassword", {
-          id: item.id,
-          password: generatePassword()
-        });
-        historyMenu.open = false;
+        try {
+          await emit("item:updatePassword", {
+            id: item.id,
+            password: generatePassword(),
+            expectedPassword: item.password
+          });
+          historyMenu.open = false;
+        } catch (error) {
+          alert(error.message || "Unable to generate password.");
+        }
       });
 
     fragment
@@ -858,7 +1040,12 @@ function renderItems() {
     fragment
       .querySelector('[data-action="delete-item"]')
       .addEventListener("click", async () => {
-        await emit("item:delete", { id: item.id });
+        if (!window.confirm(`Permanently delete "${item.name}" and ALL its password history?`)) return;
+        try {
+          await emit("item:delete", { id: item.id });
+        } catch (error) {
+          alert(error.message || "Unable to delete item.");
+        }
       });
 
     dragHandle.addEventListener("dragstart", (event) => {
@@ -904,15 +1091,27 @@ function renderItems() {
 
       const [movedId] = orderedIds.splice(fromIndex, 1);
       orderedIds.splice(toIndex, 0, movedId);
-      await emit("items:reorder", { orderedIds });
+      try {
+        await emit("items:reorder", { orderedIds });
+      } catch (error) {
+        alert(error.message || "Unable to reorder items.");
+      }
     });
 
+    applyButtonTooltips(fragment);
     elements.itemsContainer.appendChild(fragment);
   });
 
   updatePasswordVisibilityUi();
   updateRelativeTimestamps();
 }
+
+document.addEventListener("pointerdown", (event) => {
+  if (event.target.closest(".history-menu")) return;
+  document.querySelectorAll(".history-menu[open]").forEach((menu) => {
+    menu.open = false;
+  });
+});
 
 elements.createRoomButton.addEventListener("click", createRoom);
 
@@ -980,31 +1179,49 @@ elements.exportBoardButton.addEventListener("click", () => {
   downloadJson(`${slug}-${formatFilenameTimestamp()}.json`, buildExportPayload());
 });
 
+let importInProgress = false;
+let importExpectedRevision = 0;
 elements.importBoardButton.addEventListener("click", () => {
+  if (importInProgress) return;
+  importExpectedRevision = state.boardRevision;
   elements.importBoardInput.click();
 });
 
 elements.importBoardInput.addEventListener("change", async () => {
   const file = elements.importBoardInput.files?.[0];
-  if (!file) {
-    return;
-  }
-
+  if (!file || importInProgress) return;
+  importInProgress = true;
+  elements.importBoardButton.disabled = true;
   try {
-    await importBoardFromFile(file);
+    await importBoardFromFile(file, importExpectedRevision);
   } catch (error) {
-    alert(error.message || "Import failed.");
+    alert(error.message || "Import failed; existing entries were preserved.");
   } finally {
+    importInProgress = false;
+    elements.importBoardButton.disabled = false;
     elements.importBoardInput.value = "";
   }
 });
 
+elements.boardNameInput.addEventListener("focus", () => {
+  elements.boardNameInput.dataset.originalName = state.boardName;
+});
 elements.boardNameInput.addEventListener("change", async () => {
   const trimmed = elements.boardNameInput.value.trim();
   elements.boardNameInput.value = trimmed || "Untitled Board";
-  await emit("room:updateName", {
-    name: elements.boardNameInput.value
-  });
+  if (elements.boardNameInput.value === elements.boardNameInput.dataset.originalName) return;
+  boardNameSavePending = true;
+  try {
+    await emit("room:updateName", {
+      name: elements.boardNameInput.value,
+      expectedName: elements.boardNameInput.dataset.originalName
+    });
+  } catch (error) {
+    alert(`${error.message} Your draft board name was not saved.`);
+    elements.boardNameInput.focus();
+  } finally {
+    boardNameSavePending = false;
+  }
 });
 
 elements.generateNewItemPassword.addEventListener("click", () => {
@@ -1023,22 +1240,35 @@ elements.copyLargeRoomLink.addEventListener("click", async (event) => {
   await copyWithFeedback(event.currentTarget, event.currentTarget.dataset.roomLinkValue || "");
 });
 
+let itemCreateInProgress = false;
 elements.createItemForm.addEventListener("submit", async (event) => {
   event.preventDefault();
+  if (itemCreateInProgress) return;
+  itemCreateInProgress = true;
+  const submitButton = elements.createItemForm.querySelector('[type="submit"]');
+  submitButton.disabled = true;
   const formData = new FormData(elements.createItemForm);
-  await emit("item:create", {
-    name: formData.get("name"),
-    ip: formData.get("ip"),
-    username: formData.get("username"),
-    password: formData.get("password")
-  });
-
-  elements.createItemForm.reset();
-  setFreshGeneratedPassword(elements.newItemPassword);
+  try {
+    await emit("item:create", {
+      name: formData.get("name"),
+      ip: formData.get("ip"),
+      username: formData.get("username"),
+      password: formData.get("password")
+    });
+    elements.createItemForm.reset();
+    setFreshGeneratedPassword(elements.newItemPassword);
+  } catch (error) {
+    alert(error.message || "Unable to add item. Your entries are still in the form.");
+  } finally {
+    itemCreateInProgress = false;
+    submitButton.disabled = false;
+  }
 });
 
+let generatorSettingsAtOpen = null;
 elements.openGeneratorSettings.addEventListener("click", () => {
   applyGeneratorSettingsToForm();
+  generatorSettingsAtOpen = { ...state.generatorSettings };
   elements.generatorDialog.showModal();
 });
 
@@ -1075,7 +1305,8 @@ elements.generatorForm.addEventListener("submit", (event) => {
   const nextSettings = readGeneratorSettingsFromForm();
 
   emit("room:updateGeneratorSettings", {
-    generatorSettings: nextSettings
+    generatorSettings: nextSettings,
+    expectedGeneratorSettings: generatorSettingsAtOpen
   })
     .then(() => {
       state.generatorSettings = nextSettings;
@@ -1090,11 +1321,23 @@ elements.generatorForm.addEventListener("submit", (event) => {
 async function initialize() {
   await loadWordList();
   applyGeneratorSettingsToForm();
+  applyButtonTooltips();
   setInterval(updateRelativeTimestamps, 30000);
 
   const url = new URL(window.location.href);
   const queryRoomKey = extractRoomKey(url.searchParams.get("roomKey") || "");
   if (queryRoomKey) {
+    const previousRoomKey = getStoredActiveRoomKey();
+    if (previousRoomKey && previousRoomKey !== queryRoomKey && isUuid(previousRoomKey)) {
+      const switchRooms = window.confirm(
+        "You already have a PassBoard room open. Leave that room and switch to this one? " +
+        "Leaving will NOT delete its passwords or destroy the board."
+      );
+      if (!switchRooms) {
+        window.location.replace(`/room?roomKey=${encodeURIComponent(previousRoomKey)}`);
+        return;
+      }
+    }
     setStoredActiveRoomKey(queryRoomKey);
     window.history.replaceState({}, "", "/room");
   }
@@ -1113,7 +1356,7 @@ async function initialize() {
 
   const actorName = await promptForDisplayName(roomKey);
   showBoard(roomKey, actorName);
-  setConnectionStatus("connecting", "Waiting for first sync");
+  setConnectionStatus("connecting");
 
   try {
     await bootstrapRoom(roomKey);

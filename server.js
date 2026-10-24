@@ -2,6 +2,7 @@ const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 const http = require("http");
+const net = require("net");
 
 const express = require("express");
 const Database = require("better-sqlite3");
@@ -11,7 +12,7 @@ const { v4: uuidv4, validate: isUuid } = require("uuid");
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
-  maxHttpBufferSize: 256 * 1024,
+  maxHttpBufferSize: 576 * 1024,
   cors: {
     origin: true,
     methods: ["GET", "POST"]
@@ -49,6 +50,10 @@ const MUTATION_LIMIT_PER_ACTOR = 40;
 const MUTATION_LIMIT_PER_ROOM = 120;
 
 app.disable("x-powered-by");
+// Optional: TRUST_PROXY=loopback or a trusted proxy IP/CIDR (never untrusted clients).
+if (process.env.TRUST_PROXY) {
+  app.set("trust proxy", process.env.TRUST_PROXY);
+}
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
 
@@ -65,6 +70,7 @@ db.exec(`
     last_imported_by TEXT NOT NULL DEFAULT '',
     updated_at TEXT NOT NULL DEFAULT '',
     updated_by TEXT NOT NULL DEFAULT '',
+    revision INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL
   );
 
@@ -84,6 +90,8 @@ db.exec(`
     updated_at TEXT NOT NULL,
     updated_by TEXT NOT NULL DEFAULT '',
     password_rotation_count INTEGER NOT NULL DEFAULT 0,
+    password_created_at TEXT NOT NULL DEFAULT '',
+    password_created_by TEXT NOT NULL DEFAULT '',
     FOREIGN KEY(room_id) REFERENCES rooms(id) ON DELETE CASCADE
   );
 
@@ -118,12 +126,62 @@ addColumnIfMissing("rooms", "last_imported_at", "TEXT NOT NULL DEFAULT ''");
 addColumnIfMissing("rooms", "last_imported_by", "TEXT NOT NULL DEFAULT ''");
 addColumnIfMissing("rooms", "updated_at", "TEXT NOT NULL DEFAULT ''");
 addColumnIfMissing("rooms", "updated_by", "TEXT NOT NULL DEFAULT ''");
+addColumnIfMissing("rooms", "revision", "INTEGER NOT NULL DEFAULT 0");
 addColumnIfMissing("items", "sort_order", "REAL NOT NULL DEFAULT 0");
 addColumnIfMissing("items", "ip", "TEXT NOT NULL DEFAULT ''");
 addColumnIfMissing("items", "created_by", "TEXT NOT NULL DEFAULT ''");
 addColumnIfMissing("items", "updated_by", "TEXT NOT NULL DEFAULT ''");
 addColumnIfMissing("items", "password_rotation_count", "INTEGER NOT NULL DEFAULT 0");
+addColumnIfMissing("items", "password_created_at", "TEXT NOT NULL DEFAULT ''");
+addColumnIfMissing("items", "password_created_by", "TEXT NOT NULL DEFAULT ''");
 addColumnIfMissing("password_history", "created_by", "TEXT NOT NULL DEFAULT ''");
+
+// Existing history rows were timestamped when a password was REPLACED.
+// Shift their timestamps back to when each password became current, once.
+// Future changes save the creation timestamp directly.
+const migrateLegacyPasswordDates = db.transaction(() => {
+  const oldItems = db.prepare(`
+    SELECT id, created_at, created_by, updated_at, updated_by, password_rotation_count
+    FROM items WHERE password_created_at = ''
+  `).all();
+  const getHistory = db.prepare(`
+    SELECT id, created_at, created_by FROM password_history
+    WHERE item_id = ? ORDER BY created_at ASC, rowid ASC
+  `);
+  const updateHistory = db.prepare(`
+    UPDATE password_history SET created_at = ?, created_by = ? WHERE id = ?
+  `);
+  const updateItem = db.prepare(`
+    UPDATE items SET password_created_at = ?, password_created_by = ? WHERE id = ?
+  `);
+
+  for (const item of oldItems) {
+    const entries = getHistory.all(item.id);
+    if (entries.length) {
+      // If older history was trimmed, the creation time of the oldest
+      // remaining password cannot be reconstructed exactly.
+      const truncated = item.password_rotation_count > entries.length;
+      let addedAt = truncated ? entries[0].created_at : item.created_at;
+      let addedBy = truncated ? entries[0].created_by : item.created_by;
+      for (const entry of entries) {
+        updateHistory.run(addedAt, addedBy, entry.id);
+        addedAt = entry.created_at;
+        addedBy = entry.created_by;
+      }
+      updateItem.run(addedAt, addedBy, item.id);
+    } else {
+      // No retained history: original creation is exact for unrotated items.
+      // For previously rotated items, the precise date is no longer stored.
+      const rotated = item.password_rotation_count > 0;
+      updateItem.run(
+        rotated ? item.updated_at : item.created_at,
+        rotated ? item.updated_by : item.created_by,
+        item.id
+      );
+    }
+  }
+});
+migrateLegacyPasswordDates();
 
 db.exec(`
   UPDATE items
@@ -137,7 +195,7 @@ const insertRoomStmt = db.prepare(`
 `);
 
 const selectRoomStmt = db.prepare(`
-  SELECT id, name, generator_settings, last_imported_at, last_imported_by, updated_at, updated_by, created_at
+  SELECT id, name, generator_settings, last_imported_at, last_imported_by, updated_at, updated_by, revision, created_at
   FROM rooms
   WHERE id = ?
 `);
@@ -152,12 +210,17 @@ const deleteExpiredRoomsStmt = db.prepare(`
   WHERE created_at < ?
 `);
 
+const touchRoomChangeStmt = db.prepare(`
+  UPDATE rooms SET updated_at = ?, updated_by = ?, revision = revision + 1 WHERE id = ?
+`);
+
 const updateRoomNameStmt = db.prepare(`
   UPDATE rooms
   SET
     name = @name,
     updated_at = @updatedAt,
-    updated_by = @updatedBy
+    updated_by = @updatedBy,
+    revision = revision + 1
   WHERE id = @id
 `);
 
@@ -166,7 +229,8 @@ const updateRoomGeneratorSettingsStmt = db.prepare(`
   SET
     generator_settings = @generatorSettings,
     updated_at = @updatedAt,
-    updated_by = @updatedBy
+    updated_by = @updatedBy,
+    revision = revision + 1
   WHERE id = @id
 `);
 
@@ -176,7 +240,8 @@ const updateRoomImportAuditStmt = db.prepare(`
     last_imported_at = @lastImportedAt,
     last_imported_by = @lastImportedBy,
     updated_at = @updatedAt,
-    updated_by = @updatedBy
+    updated_by = @updatedBy,
+    revision = revision + 1
   WHERE id = @id
 `);
 
@@ -196,6 +261,8 @@ const selectItemsStmt = db.prepare(`
     i.updated_at,
     i.updated_by,
     i.password_rotation_count,
+    i.password_created_at,
+    i.password_created_by,
     (
       SELECT json_group_array(
         json_object(
@@ -207,9 +274,12 @@ const selectItemsStmt = db.prepare(`
           'created_by', ph.created_by
         )
       )
-      FROM password_history ph
-      WHERE ph.item_id = i.id
-      ORDER BY ph.created_at DESC
+      FROM (
+        SELECT id, password_cipher, password_iv, password_tag, created_at, created_by
+        FROM password_history
+        WHERE item_id = i.id
+        ORDER BY created_at DESC, rowid DESC
+      ) ph
     ) AS history_json
   FROM items i
   WHERE i.room_id = ?
@@ -232,7 +302,9 @@ const insertItemStmt = db.prepare(`
     created_by,
     updated_at,
     updated_by,
-    password_rotation_count
+    password_rotation_count,
+    password_created_at,
+    password_created_by
   ) VALUES (
     @id,
     @roomId,
@@ -248,7 +320,9 @@ const insertItemStmt = db.prepare(`
     @createdBy,
     @updatedAt,
     @updatedBy,
-    @passwordRotationCount
+    @passwordRotationCount,
+    @passwordCreatedAt,
+    @passwordCreatedBy
   )
 `);
 
@@ -282,6 +356,15 @@ const updateItemFieldsStmt = db.prepare(`
   WHERE id = @id AND room_id = @roomId
 `);
 
+// Update only the edited metadata field; the expected old value prevents stale clients
+// from replacing a teammate's more recent edit.
+const updateItemFieldStmts = Object.fromEntries(
+  ["name", "ip", "username"].map((field) => [field, db.prepare(`
+    UPDATE items SET ${field} = @value, updated_at = @updatedAt, updated_by = @updatedBy
+    WHERE id = @id AND room_id = @roomId AND ${field} = @expectedValue
+  `)])
+);
+
 const updateItemPasswordStmt = db.prepare(`
   UPDATE items
   SET
@@ -290,7 +373,9 @@ const updateItemPasswordStmt = db.prepare(`
     password_tag = @passwordTag,
     updated_at = @updatedAt,
     updated_by = @updatedBy,
-    password_rotation_count = @passwordRotationCount
+    password_rotation_count = @passwordRotationCount,
+    password_created_at = @passwordCreatedAt,
+    password_created_by = @passwordCreatedBy
   WHERE id = @id AND room_id = @roomId
 `);
 
@@ -348,42 +433,35 @@ const httpRateLimitStore = new Map();
 const socketRateLimitStore = new Map();
 const mutationRateLimitStore = new Map();
 
-const importRoomState = db.transaction(({ roomId, roomKey, actorName, boardName, generatorSettings, items }) => {
+// Append-only import: verify revision and room capacity inside the same transaction.
+// Existing items, their history, board name and generator settings are untouched.
+const importRoomState = db.transaction(({ roomId, roomKey, actorName, expectedRevision, items }) => {
+  const room = selectRoomStmt.get(roomId);
+  if (!room) throw createRoomGoneError();
+  if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0 || room.revision !== expectedRevision) {
+    throw new Error("The board changed before the import. Nothing was imported; review the board and try again.");
+  }
+  if (!items.length) throw new Error("The import contains no items.");
+  requireRoomCapacity(roomId, items.length);
   const updatedAt = nowIso();
-  updateRoomNameStmt.run({
-    id: roomId,
-    name: normalizeBoardName(boardName),
-    updatedAt,
-    updatedBy: actorName
-  });
-  updateRoomGeneratorSettingsStmt.run({
-    id: roomId,
-    generatorSettings: serializeGeneratorSettings(generatorSettings),
-    updatedAt,
-    updatedBy: actorName
-  });
-  updateRoomImportAuditStmt.run({
-    id: roomId,
-    lastImportedAt: updatedAt,
-    lastImportedBy: actorName,
-    updatedAt,
-    updatedBy: actorName
-  });
-
-  deleteItemsByRoomStmt.run(roomId);
-
+  const lastSortOrder = selectMaxSortOrderStmt.get(roomId).maxSortOrder;
   items.forEach((item, index) => {
     const createdAt = String(item.createdAt || nowIso());
     const createdBy = normalizeActorName(item.createdBy) || actorName;
     const updatedAt = String(item.updatedAt || createdAt);
     const updatedBy = normalizeActorName(item.updatedBy) || actorName;
     const encrypted = encryptPassword(roomKey, String(item.password || ""));
-    const sortOrder = Number.isFinite(Number(item.sortOrder)) ? Number(item.sortOrder) : index + 1;
+    const sortOrder = lastSortOrder + index + 1;
     const passwordRotationCount = Number.isFinite(Number(item.passwordRotationCount))
       ? Math.max(0, Number(item.passwordRotationCount))
       : Array.isArray(item.history)
         ? item.history.length
         : 0;
+    const passwordCreatedAt = String(
+      item.passwordCreatedAt || (passwordRotationCount ? updatedAt : createdAt)
+    );
+    const passwordCreatedBy = normalizeActorName(item.passwordCreatedBy)
+      || (passwordRotationCount ? updatedBy : createdBy);
 
     insertItemStmt.run({
       id: uuidv4(),
@@ -400,7 +478,9 @@ const importRoomState = db.transaction(({ roomId, roomKey, actorName, boardName,
       createdBy,
       updatedAt,
       updatedBy,
-      passwordRotationCount
+      passwordRotationCount,
+      passwordCreatedAt,
+      passwordCreatedBy
     });
 
     const insertedItem = db.prepare(`
@@ -426,7 +506,25 @@ const importRoomState = db.transaction(({ roomId, roomKey, actorName, boardName,
       });
     });
   });
+  updateRoomImportAuditStmt.run({
+    id: roomId,
+    lastImportedAt: updatedAt,
+    lastImportedBy: actorName,
+    updatedAt,
+    updatedBy: actorName
+  });
 });
+
+function normalizeImportedTimestamp(value, fallback, fieldName) {
+  if (value === undefined || value === null || value === "") return fallback;
+  if (typeof value !== "string") throw new Error(`${fieldName} must be a valid date string.`);
+  const parsed = Date.parse(value);
+  if (!Number.isFinite(parsed)) throw new Error(`${fieldName} is not a valid date.`);
+  if (parsed > Date.now() + 5 * 60 * 1000) {
+    throw new Error(`${fieldName} is in the future. Check the import file's dates.`);
+  }
+  return new Date(parsed).toISOString();
+}
 
 function normalizeImportedItems(items) {
   if (!Array.isArray(items)) {
@@ -437,21 +535,28 @@ function normalizeImportedItems(items) {
     throw new Error(`Import exceeds the ${MAX_IMPORT_ITEMS}-item room limit.`);
   }
 
-  return items.map((item) => ({
+  const importedAt = nowIso();
+  return items.map((item, index) => ({
     sortOrder: item?.sortOrder,
     name: normalizeItemName(item?.name),
     ip: normalizeIp(item?.ip),
     username: normalizeUsername(item?.username),
     password: normalizePassword(item?.password),
-    createdAt: item?.createdAt,
+    createdAt: normalizeImportedTimestamp(item?.createdAt, importedAt, `Item ${index + 1} createdAt`),
     createdBy: item?.createdBy,
-    updatedAt: item?.updatedAt,
+    updatedAt: normalizeImportedTimestamp(item?.updatedAt, importedAt, `Item ${index + 1} updatedAt`),
     updatedBy: item?.updatedBy,
     passwordRotationCount: item?.passwordRotationCount,
+    // Preserve the original fallback logic for older exports without this field.
+    passwordCreatedAt: item?.passwordCreatedAt
+      ? normalizeImportedTimestamp(item.passwordCreatedAt, importedAt, `Item ${index + 1} passwordCreatedAt`)
+      : undefined,
+    passwordCreatedBy: item?.passwordCreatedBy,
     history: Array.isArray(item?.history)
-      ? item.history.slice(0, MAX_HISTORY_ENTRIES_PER_ITEM).map((entry) => ({
+      ? item.history.slice(0, MAX_HISTORY_ENTRIES_PER_ITEM).map((entry, historyIndex) => ({
           password: normalizePassword(entry?.password),
-          createdAt: entry?.createdAt,
+          createdAt: normalizeImportedTimestamp(entry?.createdAt, importedAt,
+            `Item ${index + 1} history ${historyIndex + 1} createdAt`),
           createdBy: entry?.createdBy
         }))
       : []
@@ -628,7 +733,20 @@ function requireHttpRateLimit(req, scope, limit, windowMs) {
 }
 
 function getSocketRateLimitKey(socket, scope) {
-  return `${scope}:${socket.handshake.address || socket.conn.remoteAddress || "unknown"}`;
+  let address = socket.handshake.address || socket.conn.remoteAddress || "unknown";
+  const forwardedFor = socket.handshake.headers?.["x-forwarded-for"];
+  const trustProxy = app.get("trust proxy fn");
+
+  if (typeof forwardedFor === "string" && trustProxy(address, 0)) {
+    const forwarded = forwardedFor.split(",");
+    for (let i = forwarded.length - 1, hop = 0; i >= 0; i--, hop++) {
+      const candidate = forwarded[i].trim();
+      if (!trustProxy(address, hop) || !net.isIP(candidate)) break;
+      address = candidate;
+    }
+  }
+
+  return `${scope}:${address}`;
 }
 
 function requireSocketRateLimit(socket, scope, limit, windowMs) {
@@ -676,6 +794,7 @@ function roomLookupId(roomKey) {
 function createRoomGoneError() {
   const error = new Error("Room not found or has expired.");
   error.code = "ROOM_GONE";
+  error.statusCode = 404;
   return error;
 }
 
@@ -742,7 +861,7 @@ function ensureRoomExists(roomKey) {
     id,
     name: "Untitled Board",
     generatorSettings: serializeGeneratorSettings(),
-    updatedAt: createdAt,
+    updatedAt: "",
     updatedBy: "",
     createdAt
   });
@@ -814,16 +933,27 @@ function mapRoomState(roomKey) {
   const room = requireActiveRoom(roomKey);
   const id = room.id;
   const rows = selectItemsStmt.all(id);
+  // Include legacy item edits, which previously didn't update rooms.updated_at.
+  // Ignore the original creation timestamp; a new empty room has no changes yet.
+  const changedAt = room.updated_at || rows.map((item) => item.updated_at)
+    .filter((timestamp) => timestamp && timestamp !== room.created_at && Number.isFinite(Date.parse(timestamp)) && Date.parse(timestamp) <= Date.now())
+    .reduce((latest, timestamp) => !latest || Date.parse(timestamp) > Date.parse(latest) ? timestamp : latest, "");
 
   return {
     roomId: room.id,
+    // The frontend must use field-specific writes to avoid overwriting teammates' edits.
+    clientProtocolVersion: "field-updates-v1",
     boardName: room.name,
     generatorSettings: parseGeneratorSettings(room.generator_settings),
     lastImportedAt: room.last_imported_at,
     lastImportedBy: room.last_imported_by,
-    boardUpdatedAt: room.updated_at,
+    boardUpdatedAt: changedAt,
     boardUpdatedBy: room.updated_by,
+    boardRevision: room.revision,
     createdAt: room.created_at,
+    expiresAt: Number.isFinite(Date.parse(room.created_at))
+      ? new Date(Date.parse(room.created_at) + ROOM_TTL_MS).toISOString()
+      : null,
     activeUsers: getActiveUsers(roomKey),
     items: rows.map((row) => ({
       id: row.id,
@@ -841,6 +971,8 @@ function mapRoomState(roomKey) {
       updatedAt: row.updated_at,
       updatedBy: row.updated_by,
       passwordRotationCount: row.password_rotation_count,
+      passwordCreatedAt: row.password_created_at,
+      passwordCreatedBy: row.password_created_by,
       history: parseHistory(row.history_json).reverse().map((entry) => ({
         id: entry.id,
         password: decryptPassword(roomKey, {
@@ -856,7 +988,7 @@ function mapRoomState(roomKey) {
 }
 
 const setItemPasswordWithHistory = db.transaction(
-  ({ itemId, roomId, roomKey, nextPassword, updatedAt, updatedBy }) => {
+  ({ itemId, roomId, roomKey, nextPassword, expectedPassword, updatedAt, updatedBy }) => {
     const existing = selectItemStmt.get(itemId, roomId);
     if (!existing) {
       throw new Error("Item not found.");
@@ -868,18 +1000,12 @@ const setItemPasswordWithHistory = db.transaction(
       tag: existing.password_tag
     });
 
+    if (typeof expectedPassword === "string" && currentPassword !== expectedPassword) {
+      throw new Error("This password changed on another client. Your edit was not saved.");
+    }
+
     if (currentPassword === nextPassword) {
-      updateItemPasswordStmt.run({
-        id: itemId,
-        roomId,
-        passwordCipher: existing.password_cipher,
-        passwordIv: existing.password_iv,
-        passwordTag: existing.password_tag,
-        updatedAt,
-        updatedBy,
-        passwordRotationCount: existing.password_rotation_count || 0
-      });
-      return;
+      return false;
     }
 
     if (currentPassword) {
@@ -890,8 +1016,8 @@ const setItemPasswordWithHistory = db.transaction(
         passwordCipher: existing.password_cipher,
         passwordIv: existing.password_iv,
         passwordTag: existing.password_tag,
-        createdAt: updatedAt,
-        createdBy: updatedBy
+        createdAt: existing.password_created_at,
+        createdBy: existing.password_created_by
       });
       trimHistoryStmt.run({
         itemId,
@@ -908,8 +1034,11 @@ const setItemPasswordWithHistory = db.transaction(
       passwordTag: encrypted.tag,
       updatedAt,
       updatedBy,
-      passwordRotationCount: (existing.password_rotation_count || 0) + 1
+      passwordRotationCount: (existing.password_rotation_count || 0) + 1,
+      passwordCreatedAt: updatedAt,
+      passwordCreatedBy: updatedBy
     });
+    return true;
   }
 );
 
@@ -927,6 +1056,7 @@ app.use((req, res, next) => {
 app.use(express.static(path.join(__dirname, "public")));
 
 app.get("/api/rooms/:roomKey/bootstrap", (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
   try {
     requireHttpRateLimit(req, "bootstrap", HTTP_BOOTSTRAP_LIMIT, HTTP_RATE_LIMIT_WINDOW_MS);
     const { roomKey } = req.params;
@@ -946,6 +1076,7 @@ app.get("/api/rooms/:roomKey/bootstrap", (req, res) => {
 });
 
 app.get("/api/rooms/new", (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
   try {
     requireHttpRateLimit(req, "new-room", HTTP_NEW_ROOM_LIMIT, HTTP_RATE_LIMIT_WINDOW_MS);
     const roomKey = uuidv4();
@@ -980,38 +1111,40 @@ app.use((error, _req, res, next) => {
 });
 
 app.get("/room/:roomKey", (req, res) => {
-  if (!ensureRoomKey(req.params.roomKey)) {
-    return res.status(400).send("Invalid room key.");
-  }
+  try {
+    if (!ensureRoomKey(req.params.roomKey)) {
+      return res.status(400).send("Invalid room key.");
+    }
 
-  const room = requireActiveRoom(req.params.roomKey);
-  if (!room) {
-    return res.status(404).send("Room not found or has expired.");
+    requireActiveRoom(req.params.roomKey);
+    return res.redirect(302, `/room?roomKey=${encodeURIComponent(req.params.roomKey)}`);
+  } catch (error) {
+    return res.status(error.statusCode || 500).send(error.message || "Request failed.");
   }
-
-  return res.redirect(302, `/room?roomKey=${encodeURIComponent(req.params.roomKey)}`);
 });
 
 io.use((socket, next) => {
-  const roomKey = socket.handshake.auth?.roomKey;
-  const actorName = normalizeActorName(socket.handshake.auth?.actorName);
-  if (!consumeRateLimit(socketRateLimitStore, getSocketRateLimitKey(socket, "connect"), SOCKET_CONNECT_LIMIT, SOCKET_CONNECT_WINDOW_MS)) {
-    return next(new Error("Too many connection attempts. Please slow down."));
-  }
-  if (!ensureRoomKey(roomKey)) {
-    return next(new Error("Invalid room key."));
-  }
-  if (!actorName) {
-    return next(new Error("Display name is required."));
-  }
-  if (!requireActiveRoom(roomKey)) {
-    return next(new Error("Room not found or has expired."));
-  }
+  try {
+    const roomKey = socket.handshake.auth?.roomKey;
+    const actorName = normalizeActorName(socket.handshake.auth?.actorName);
+    if (!consumeRateLimit(socketRateLimitStore, getSocketRateLimitKey(socket, "connect"), SOCKET_CONNECT_LIMIT, SOCKET_CONNECT_WINDOW_MS)) {
+      return next(new Error("Too many connection attempts. Please slow down."));
+    }
+    if (!ensureRoomKey(roomKey)) {
+      return next(new Error("Invalid room key."));
+    }
+    if (!actorName) {
+      return next(new Error("Display name is required."));
+    }
+    requireActiveRoom(roomKey);
 
-  socket.data.roomKey = roomKey;
-  socket.data.roomId = roomLookupId(roomKey);
-  socket.data.actorName = actorName;
-  return next();
+    socket.data.roomKey = roomKey;
+    socket.data.roomId = roomLookupId(roomKey);
+    socket.data.actorName = actorName;
+    return next();
+  } catch (error) {
+    return next(error);
+  }
 });
 
 function emitRoomState(roomKey) {
@@ -1034,9 +1167,16 @@ io.on("connection", (socket) => {
 
   socket.on("room:updateName", (payload, callback = () => {}) => {
     try {
-      assertActiveRoomForMutation(roomKey);
+      const room = assertActiveRoomForMutation(roomKey);
       requireMutationRateLimit(socket, roomId, "room-update");
       const name = normalizeBoardName(payload?.name);
+      if (typeof payload?.expectedName === "string" && room.name !== payload.expectedName) {
+        throw new Error("The board name changed on another client. Your edit was not saved.");
+      }
+      if (name === room.name) {
+        if (typeof callback === "function") callback({ ok: true });
+        return;
+      }
       const result = updateRoomNameStmt.run({
         id: roomId,
         name,
@@ -1046,34 +1186,43 @@ io.on("connection", (socket) => {
       assertMutationApplied(result, "Room not found or has expired.");
 
       emitRoomState(roomKey);
-      callback({ ok: true });
+      if (typeof callback === "function") callback({ ok: true });
     } catch (error) {
       if (error.code === "ROOM_GONE") {
         emitRoomClosed(roomKey, "expired");
       }
-      callback({ ok: false, error: error.message });
+      if (typeof callback === "function") callback({ ok: false, error: error.message });
     }
   });
 
   socket.on("room:updateGeneratorSettings", (payload, callback = () => {}) => {
     try {
-      assertActiveRoomForMutation(roomKey);
+      const room = assertActiveRoomForMutation(roomKey);
       requireMutationRateLimit(socket, roomId, "room-settings");
+      const generatorSettings = serializeGeneratorSettings(payload?.generatorSettings);
+      if (payload?.expectedGeneratorSettings &&
+          serializeGeneratorSettings(payload.expectedGeneratorSettings) !== serializeGeneratorSettings(parseGeneratorSettings(room.generator_settings))) {
+        throw new Error("Generator settings changed on another client. Your edits were not saved.");
+      }
+      if (generatorSettings === serializeGeneratorSettings(parseGeneratorSettings(room.generator_settings))) {
+        if (typeof callback === "function") callback({ ok: true });
+        return;
+      }
       const result = updateRoomGeneratorSettingsStmt.run({
         id: roomId,
-        generatorSettings: serializeGeneratorSettings(payload?.generatorSettings),
+        generatorSettings,
         updatedAt: nowIso(),
         updatedBy: actorName
       });
       assertMutationApplied(result, "Room not found or has expired.");
 
       emitRoomState(roomKey);
-      callback({ ok: true });
+      if (typeof callback === "function") callback({ ok: true });
     } catch (error) {
       if (error.code === "ROOM_GONE") {
         emitRoomClosed(roomKey, "expired");
       }
-      callback({ ok: false, error: error.message });
+      if (typeof callback === "function") callback({ ok: false, error: error.message });
     }
   });
 
@@ -1089,18 +1238,17 @@ io.on("connection", (socket) => {
         roomId,
         roomKey,
         actorName,
-        boardName: payload?.boardName,
-        generatorSettings: payload?.generatorSettings,
+        expectedRevision: payload?.expectedRevision,
         items: normalizedItems
       });
 
       emitRoomState(roomKey);
-      callback({ ok: true });
+      if (typeof callback === "function") callback({ ok: true });
     } catch (error) {
       if (error.code === "ROOM_GONE") {
         emitRoomClosed(roomKey, "expired");
       }
-      callback({ ok: false, error: error.message });
+      if (typeof callback === "function") callback({ ok: false, error: error.message });
     }
   });
 
@@ -1115,23 +1263,29 @@ io.on("connection", (socket) => {
 
       if (
         orderedIds.length !== currentIds.length ||
+        new Set(orderedIds).size !== orderedIds.length ||
         orderedIds.some((id) => !currentIds.includes(id))
       ) {
         throw new Error("Reorder payload does not match current board items.");
       }
 
+      if (orderedIds.every((id, index) => id === currentIds[index])) {
+        if (typeof callback === "function") callback({ ok: true });
+        return;
+      }
       reorderItems({
         roomId,
         orderedIds
       });
+      touchRoomChangeStmt.run(nowIso(), actorName, roomId);
 
       emitRoomState(roomKey);
-      callback({ ok: true });
+      if (typeof callback === "function") callback({ ok: true });
     } catch (error) {
       if (error.code === "ROOM_GONE") {
         emitRoomClosed(roomKey, "expired");
       }
-      callback({ ok: false, error: error.message });
+      if (typeof callback === "function") callback({ ok: false, error: error.message });
     }
   });
 
@@ -1160,16 +1314,19 @@ io.on("connection", (socket) => {
         createdBy: actorName,
         updatedAt: createdAt,
         updatedBy: actorName,
-        passwordRotationCount: 0
+        passwordRotationCount: 0,
+        passwordCreatedAt: createdAt,
+        passwordCreatedBy: actorName
       });
+      touchRoomChangeStmt.run(createdAt, actorName, roomId);
 
       emitRoomState(roomKey);
-      callback({ ok: true });
+      if (typeof callback === "function") callback({ ok: true });
     } catch (error) {
       if (error.code === "ROOM_GONE") {
         emitRoomClosed(roomKey, "expired");
       }
-      callback({ ok: false, error: error.message });
+      if (typeof callback === "function") callback({ ok: false, error: error.message });
     }
   });
 
@@ -1178,25 +1335,39 @@ io.on("connection", (socket) => {
       assertActiveRoomForMutation(roomKey);
       requireMutationRateLimit(socket, roomId, "item-update");
       const itemId = String(payload?.id || "");
-      const result = updateItemFieldsStmt.run({
-        id: itemId,
-        roomId,
-        name: normalizeItemName(payload?.name),
-        ip: normalizeIp(payload?.ip),
-        port: "",
-        username: normalizeUsername(payload?.username),
-        updatedAt: nowIso(),
-        updatedBy: actorName
-      });
-      assertMutationApplied(result, "Item not found.");
-
-      emitRoomState(roomKey);
-      callback({ ok: true });
-    } catch (error) {
-      if (error.code === "ROOM_GONE") {
-        emitRoomClosed(roomKey, "expired");
+      const field = payload?.field;
+      if (field === undefined && payload && typeof payload === "object" && ("name" in payload || "ip" in payload || "username" in payload)) {
+        throw new Error("Your browser is using an older PassBoard version. Refresh the page before editing.");
       }
-      callback({ ok: false, error: error.message });
+      if (!Object.hasOwn(updateItemFieldStmts, field)) {
+        throw new Error("Invalid item field.");
+      }
+      const normalize = field === "name" ? normalizeItemName
+        : field === "ip" ? normalizeIp : normalizeUsername;
+      const value = normalize(payload?.value);
+      const expectedValue = normalize(payload?.expectedValue);
+      const previous = selectItemStmt.get(itemId, roomId);
+      if (!previous) throw new Error("Item not found.");
+      if (previous[field] !== expectedValue) {
+        throw new Error("This field changed on another client. Your edit was not saved.");
+      }
+      if (previous[field] === value) {
+        if (typeof callback === "function") callback({ ok: true });
+        return;
+      }
+      const updatedAt = nowIso();
+      const result = updateItemFieldStmts[field].run({
+        id: itemId, roomId, value, expectedValue, updatedAt, updatedBy: actorName
+      });
+      if (!result.changes) {
+        throw new Error("This field changed on another client. Your edit was not saved.");
+      }
+      touchRoomChangeStmt.run(updatedAt, actorName, roomId);
+      emitRoomState(roomKey);
+      if (typeof callback === "function") callback({ ok: true });
+    } catch (error) {
+      if (error.code === "ROOM_GONE") emitRoomClosed(roomKey, "expired");
+      if (typeof callback === "function") callback({ ok: false, error: error.message });
     }
   });
 
@@ -1204,22 +1375,26 @@ io.on("connection", (socket) => {
     try {
       assertActiveRoomForMutation(roomKey);
       requireMutationRateLimit(socket, roomId, "password-update");
-      setItemPasswordWithHistory({
+      const updatedAt = nowIso();
+      const changed = setItemPasswordWithHistory({
         itemId: String(payload?.id || ""),
         roomId,
         roomKey,
         nextPassword: normalizePassword(payload?.password),
-        updatedAt: nowIso(),
+        expectedPassword: payload?.expectedPassword,
+        updatedAt,
         updatedBy: actorName
       });
-
-      emitRoomState(roomKey);
-      callback({ ok: true });
+      if (changed) {
+        touchRoomChangeStmt.run(updatedAt, actorName, roomId);
+        emitRoomState(roomKey);
+      }
+      if (typeof callback === "function") callback({ ok: true });
     } catch (error) {
       if (error.code === "ROOM_GONE") {
         emitRoomClosed(roomKey, "expired");
       }
-      callback({ ok: false, error: error.message });
+      if (typeof callback === "function") callback({ ok: false, error: error.message });
     }
   });
 
@@ -1229,13 +1404,14 @@ io.on("connection", (socket) => {
       requireMutationRateLimit(socket, roomId, "item-delete");
       const result = deleteItemStmt.run(String(payload?.id || ""), roomId);
       assertMutationApplied(result, "Item not found.");
+      touchRoomChangeStmt.run(nowIso(), actorName, roomId);
       emitRoomState(roomKey);
-      callback({ ok: true });
+      if (typeof callback === "function") callback({ ok: true });
     } catch (error) {
       if (error.code === "ROOM_GONE") {
         emitRoomClosed(roomKey, "expired");
       }
-      callback({ ok: false, error: error.message });
+      if (typeof callback === "function") callback({ ok: false, error: error.message });
     }
   });
 
@@ -1249,7 +1425,7 @@ io.on("connection", (socket) => {
         destroyedAt: nowIso(),
         destroyedBy: actorName
       });
-      callback({ ok: true });
+      if (typeof callback === "function") callback({ ok: true });
 
       setTimeout(() => {
         const roomSockets = io.sockets.adapter.rooms.get(roomId);
@@ -1265,7 +1441,7 @@ io.on("connection", (socket) => {
       if (error.code === "ROOM_GONE") {
         emitRoomClosed(roomKey, "expired");
       }
-      callback({ ok: false, error: error.message });
+      if (typeof callback === "function") callback({ ok: false, error: error.message });
     }
   });
 

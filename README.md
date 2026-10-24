@@ -22,6 +22,7 @@ Real-time room-based password sharing for teams in cybersecurity competitions. A
 - The database stores encrypted passwords and a hash of the room UUID, not the raw room key itself.
 - Rooms are deleted 7 days from their creation date.
 - The built-in password generator is convenience-focused, especially in word mode, so do not assume generated values meet strong cryptographic password requirements.
+- When deploying behind a reverse proxy, configure the `TRUST_PROXY` environment variable to ensure that rate limiting is applied. Use `TRUST_PROXY=loopback` if the proxy is on the same host.
 
 ## Run locally
 

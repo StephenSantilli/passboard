@@ -583,7 +583,8 @@ summary {
 
 .history-list {
   position: absolute;
-  top: calc(100% + 0.5rem);
+  top: auto;
+  bottom: calc(100% + 0.5rem);
   right: 0;
   z-index: 10;
   min-width: 240px;
@@ -872,4 +873,64 @@ output {
   .danger {
     width: 100%;
   }
+}
+
+/* Room expiry and intentionally compact, 250ms-delayed action tooltips. */
+.room-expiration-line {
+  color: var(--muted);
+  margin: -0.25rem 0 0.85rem;
+  font-size: 0.94rem;
+}
+
+#room-expiration {
+  color: var(--text);
+  font-weight: 650;
+  border-bottom: 1px dotted var(--muted);
+  cursor: help;
+}
+
+.quick-tooltip {
+  position: relative;
+}
+
+.quick-tooltip[data-tooltip]::after {
+  content: attr(data-tooltip);
+  position: absolute;
+  z-index: 100;
+  bottom: calc(100% + 0.45rem);
+  left: 50%;
+  transform: translateX(-50%);
+  width: max-content;
+  max-width: min(310px, 75vw);
+  padding: 0.45rem 0.65rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #182c3b;
+  color: var(--text);
+  box-shadow: var(--shadow);
+  font-size: 0.76rem;
+  line-height: 1.3;
+  font-weight: 500;
+  white-space: normal;
+  text-align: center;
+  pointer-events: none;
+  opacity: 0;
+  visibility: hidden;
+}
+
+.quick-tooltip[data-tooltip]:hover::after,
+.quick-tooltip[data-tooltip]:focus-visible::after {
+  opacity: 1;
+  visibility: visible;
+  transition: opacity 0s 250ms, visibility 0s 250ms;
+}
+
+.history-entry.current {
+  border: 1px solid rgba(247, 105, 0, 0.5);
+}
+
+.history-empty {
+  color: var(--muted);
+  font-size: 0.85rem;
+  padding: 0.35rem;
 }
